@@ -456,6 +456,7 @@ struct Probe {
     doc_figure: Option<egui::Rect>,
     doc_article: Option<egui::Rect>,
     institute_link: Option<egui::Rect>,
+    header_state: Option<egui::Rect>,
     analysis_viewport: Option<egui::Rect>,
     sweep_plot_transforms: [Option<egui_plot::PlotTransform>; 4],
     voltage_plot_y_bounds: Option<[f64; 2]>,
@@ -3281,12 +3282,8 @@ impl LabApp {
                     .size(12.0)
                     .color(Color32::LIGHT_GRAY),
             );
-            if self.tab != 6 {
-                let ctx = ui.ctx().clone();
-                self.run_controls(ui, &ctx);
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                egui::Frame::new()
+                let state = egui::Frame::new()
                     .fill(Color32::from_rgb(34, 53, 59))
                     .corner_radius(5)
                     .inner_margin(egui::Margin::symmetric(10, 4))
@@ -3302,6 +3299,16 @@ impl LabApp {
                                 .strong(),
                         );
                     });
+                #[cfg(test)]
+                {
+                    self.probe.header_state = Some(state.response.rect);
+                }
+                #[cfg(not(test))]
+                let _ = state;
+                if self.tab != 6 {
+                    let ctx = ui.ctx().clone();
+                    self.run_controls(ui, &ctx);
+                }
                 let link = ui.label(
                     RichText::new("Aether Research Institute")
                         .size(11.0)
@@ -3802,6 +3809,10 @@ mod ui_tests {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
         let probe = h.app.probe;
         let button = probe.run_button.expect("RUN button");
+        let institute = probe.institute_link.expect("institute credit");
+        let state = probe.header_state.expect("header state");
+        assert!(institute.right() < button.left() && button.right() < state.left(),
+            "{label}: expected institute, RUN, status in that order at {size:?}");
         let scroll = probe.input_scroll.expect("input form");
         let bar = probe.status_bar.expect("application status bar");
         assert!(probe.header_bar.expect("header").contains_rect(button));
