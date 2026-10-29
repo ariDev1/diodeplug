@@ -1570,7 +1570,7 @@ impl LabApp {
                     .strong(),
             )
             .fill(Color32::from_rgb(38, 109, 108))
-            .min_size(egui::vec2(110.0, 26.0)),
+            .min_size(egui::vec2(110.0, 22.0)),
         ).on_hover_text("Run the current configuration and save a new result. Numerical checks do not validate hardware.");
         if run.clicked() {
             self.start(ctx);
@@ -3813,6 +3813,8 @@ mod ui_tests {
         let state = probe.header_state.expect("header state");
         assert!(institute.right() < button.left() && button.right() < state.left(),
             "{label}: expected institute, RUN, status in that order at {size:?}");
+        assert!((button.height() - state.height()).abs() <= 0.5,
+            "{label}: RUN and status heights differ at {size:?}: {button:?} vs {state:?}");
         let scroll = probe.input_scroll.expect("input form");
         let bar = probe.status_bar.expect("application status bar");
         assert!(probe.header_bar.expect("header").contains_rect(button));
