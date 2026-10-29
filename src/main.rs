@@ -2128,150 +2128,33 @@ impl LabApp {
             m.cycles_integrated
         ));
         let h = ((ui.available_height() - 45.0) * 0.5).clamp(150.0, 320.0);
-        Plot::new(self.trace_plot_id("voltage_trace"))
-            .height(h)
-            .legend(Legend::default())
-            .label_formatter(|pos| {
-                trace_hover(
-                    pos,
-                    &point.waveform,
-                    &[
-                        ("Source", |r| r.source_v),
-                        ("Port A–B", |r| r.port_v),
-                        ("Load P–N", |r| r.load_v),
-                    ],
-                    "V",
-                )
-            })
-            .show(ui, |plot| {
-                for (name, color, value) in [
-                    (
-                        "Source V",
-                        BLUE,
-                        (|r: &diode_plug_lab::solver::Trace| r.source_v)
-                            as fn(&diode_plug_lab::solver::Trace) -> f64,
-                    ),
-                    (
-                        "Port A–B V",
-                        TEAL,
-                        (|r: &diode_plug_lab::solver::Trace| r.port_v)
-                            as fn(&diode_plug_lab::solver::Trace) -> f64,
-                    ),
-                    (
-                        "Load P–N V",
-                        ORANGE,
-                        (|r: &diode_plug_lab::solver::Trace| r.load_v)
-                            as fn(&diode_plug_lab::solver::Trace) -> f64,
-                    ),
-                ] {
-                    plot.line(
-                        Line::new(
-                            name,
-                            point
-                                .waveform
-                                .iter()
-                                .map(|r| [r.time_s * 1e3, value(r)])
-                                .collect::<Vec<_>>(),
-                        )
-                        .color(color),
-                    );
-                }
-            });
-        Plot::new(self.trace_plot_id("current_trace"))
-            .height(h)
-            .legend(Legend::default())
-            .label_formatter(|pos| {
-                let mut traces: Vec<(&str, fn(&diode_plug_lab::solver::Trace) -> f64)> = vec![
-                    ("Input", |r| r.input_a),
-                    ("Load", |r| r.load_a),
-                    ("D1", |r| r.diode_1_a),
-                    ("D2", |r| r.diode_2_a),
-                ];
-                if self
-                    .sweep
-                    .as_ref()
-                    .is_some_and(|s| s.effective_circuit.ac_return.is_some())
-                {
-                    traces.push(("Passive plug", |r| r.plug_input_a));
-                    traces.push(("Powered return", |r| r.return_injection_a));
-                }
-                trace_hover(pos, &point.waveform, &traces, "A")
-            })
-            .show(ui, |plot| {
-                plot.line(
-                    Line::new(
-                        "Input A",
-                        point
-                            .waveform
-                            .iter()
-                            .map(|r| [r.time_s * 1e3, r.input_a])
-                            .collect::<Vec<_>>(),
-                    )
-                    .color(BLUE),
-                );
-                plot.line(
-                    Line::new(
-                        "Load A",
-                        point
-                            .waveform
-                            .iter()
-                            .map(|r| [r.time_s * 1e3, r.load_a])
-                            .collect::<Vec<_>>(),
-                    )
-                    .color(TEAL),
-                );
-                if self
-                    .sweep
-                    .as_ref()
-                    .is_some_and(|s| s.effective_circuit.ac_return.is_some())
-                {
-                    plot.line(
-                        Line::new(
-                            "Passive plug A",
-                            point
-                                .waveform
-                                .iter()
-                                .map(|r| [r.time_s * 1e3, r.plug_input_a])
-                                .collect::<Vec<_>>(),
-                        )
-                        .color(Color32::LIGHT_GREEN),
-                    );
-                    plot.line(
-                        Line::new(
-                            "Powered return injection A",
-                            point
-                                .waveform
-                                .iter()
-                                .map(|r| [r.time_s * 1e3, r.return_injection_a])
-                                .collect::<Vec<_>>(),
-                        )
-                        .color(Color32::LIGHT_YELLOW),
-                    );
-                }
-                plot.line(
-                    Line::new(
-                        "Diode D1 A",
-                        point
-                            .waveform
-                            .iter()
-                            .map(|r| [r.time_s * 1e3, r.diode_1_a])
-                            .collect::<Vec<_>>(),
-                    )
-                    .color(ORANGE),
-                );
-                plot.line(
-                    Line::new(
-                        "Diode D2 A",
-                        point
-                            .waveform
-                            .iter()
-                            .map(|r| [r.time_s * 1e3, r.diode_2_a])
-                            .collect::<Vec<_>>(),
-                    )
-                    .color(Color32::LIGHT_RED),
-                );
-            });
-        ui.small("Horizontal axis: time in settled period (ms). Port current uses passive sign convention.");
+        let voltage = [
+            ScopeChannel::new("Source", BLUE, |r| r.source_v),
+            ScopeChannel::new("Port A–B", TEAL, |r| r.port_v),
+            ScopeChannel::new("Load P–N", ORANGE, |r| r.load_v),
+        ];
+        let _ = scope_plot(
+            ui,
+            self.trace_plot_id("voltage_trace"),
+            h,
+            &point.waveform,
+            &voltage,
+            "V",
+        );
+        let powered_return = self
+            .sweep
+            .as_ref()
+            .is_some_and(|s| s.effective_circuit.ac_return.is_some());
+        let current = waveform_current_channels(powered_return);
+        let _ = scope_plot(
+            ui,
+            self.trace_plot_id("current_trace"),
+            h,
+            &point.waveform,
+            &current,
+            "A",
+        );
+        ui.small("Hover for the nearest recorded sample · time in ms · port current uses passive sign convention.");
     }
 
     fn diagnostics(&self, ui: &mut egui::Ui) {
@@ -3062,6 +2945,26 @@ impl ScopeChannel {
     ) -> Self {
         Self { name, color, value }
     }
+}
+
+fn waveform_current_channels(powered_return: bool) -> Vec<ScopeChannel> {
+    let mut channels = vec![
+        ScopeChannel::new("Input", BLUE, |r| r.input_a),
+        ScopeChannel::new("Load", TEAL, |r| r.load_a),
+    ];
+    if powered_return {
+        channels.push(ScopeChannel::new("Passive plug", Color32::LIGHT_GREEN, |r| {
+            r.plug_input_a
+        }));
+        channels.push(ScopeChannel::new("Powered return", Color32::LIGHT_YELLOW, |r| {
+            r.return_injection_a
+        }));
+    }
+    channels.extend([
+        ScopeChannel::new("Diode D1", ORANGE, |r| r.diode_1_a),
+        ScopeChannel::new("Diode D2", Color32::LIGHT_RED, |r| r.diode_2_a),
+    ]);
+    channels
 }
 
 fn scope_value(value: f64, unit: &str) -> String {
@@ -4402,6 +4305,78 @@ mod ui_tests {
             transform.value_from_position(pointer).x,
             second_transform.value_from_position(pointer).x
         );
+    }
+
+    #[test]
+    fn waveform_scope_cursor_tracks_voltage_and_current_samples() {
+        let point = diode_plug_lab::solver::simulate(&Circuit::default(), 1.0, None).unwrap();
+        let voltage = [
+            ScopeChannel::new("Source", BLUE, |r| r.source_v),
+            ScopeChannel::new("Port A–B", TEAL, |r| r.port_v),
+            ScopeChannel::new("Load P–N", ORANGE, |r| r.load_v),
+        ];
+        assert_eq!(waveform_current_channels(false).len(), 4);
+        let current = waveform_current_channels(true);
+        assert_eq!(current.len(), 6);
+        assert_eq!(current[2].name, "Passive plug");
+        assert_eq!(current[3].name, "Powered return");
+        assert_eq!(scope_value(-0.025, "A"), "-25.000 mA");
+
+        for (name, channels, unit) in [
+            ("test_waveform_voltage", voltage.as_slice(), "V"),
+            ("test_waveform_current", current.as_slice(), "A"),
+        ] {
+            let ctx = egui::Context::default();
+            let size = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 450.0));
+            let mut transform = None;
+            for frame in 0..2 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(size),
+                        time: Some(frame as f64),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        transform = Some(scope_plot(
+                            ui,
+                            (name, 0, Some(0)),
+                            280.0,
+                            &point.waveform,
+                            channels,
+                            unit,
+                        ).0);
+                    },
+                );
+                output.textures_delta.clear();
+            }
+            let transform = transform.unwrap();
+            let sample_index = point.waveform.len() / 3;
+            let pointer = transform.position_from_point(&egui_plot::PlotPoint::new(
+                point.waveform[sample_index].time_s * 1e3,
+                (transform.bounds().min()[1] + transform.bounds().max()[1]) * 0.5,
+            ));
+            let mut hovered = None;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(size),
+                    time: Some(2.0),
+                    events: vec![egui::Event::PointerMoved(pointer)],
+                    ..Default::default()
+                },
+                |ui| {
+                    hovered = Some(scope_plot(
+                        ui,
+                        (name, 0, Some(0)),
+                        280.0,
+                        &point.waveform,
+                        channels,
+                        unit,
+                    ).1);
+                },
+            );
+            output.textures_delta.clear();
+            assert_eq!(hovered.unwrap(), Some(sample_index), "{name}");
+        }
     }
 
     #[test]
