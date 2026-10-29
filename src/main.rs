@@ -1670,165 +1670,6 @@ impl LabApp {
             }
         }
         ui.separator();
-        let rows = sweep.results.len();
-        let focus_row = self
-            .selected
-            .filter(|&i| self.table_focused != Some((self.plot_generation, i)));
-        // Key the table's scroll state to the run so a previous run cannot hide
-        // the new column header or the newly selected row.
-        let table = egui::ScrollArea::both()
-            .id_salt(("sweep_table_scroll", self.plot_generation))
-            // Leave room for the outer analysis scrollbar on compact windows.
-            .max_width((ui.clip_rect().right() - ui.cursor().left() - 8.0).max(100.0))
-            .max_height((ui.available_height() * 0.65).clamp(140.0, 420.0))
-            .animated(false)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Grid::new("sweep_table")
-                    .striped(true)
-                    .min_col_width(95.0)
-                    .show(ui, |ui| {
-                        for (column, title) in [
-                            "C each (µF)",
-                            "Load V rms",
-                            "Load W",
-                            "Input A rms",
-                            "Zin (Ω)",
-                            "|Γ|",
-                            "G total (mS)",
-                            "Balance %",
-                        ]
-                        .into_iter()
-                        .enumerate()
-                        {
-                            let header = ui.strong(title);
-                            #[cfg(test)]
-                            if column == 0 {
-                                self.probe.table_header = Some(header.rect);
-                            }
-                            #[cfg(not(test))]
-                            let _ = (column, header);
-                        }
-                        ui.end_row();
-                        for i in 0..rows {
-                            match &sweep.results[i] {
-                                Ok(r) => {
-                                    let m = &r.metrics;
-                                    let selected = self.selected == Some(i);
-                                    let mut clicked = false;
-                                    let first_cell = ui.selectable_label(
-                                        selected,
-                                        RichText::new(format!(
-                                            "{}{:0.5}",
-                                            if selected { "▶ " } else { "" },
-                                            m.capacitance_each_uf
-                                        ))
-                                        .color(if selected { GOLD } else { Color32::LIGHT_GRAY })
-                                        .strong(),
-                                    );
-                                    clicked |= first_cell.clicked();
-                                    if focus_row == Some(i) {
-                                        ui.scroll_to_rect(first_cell.rect, None);
-                                    }
-                                    #[cfg(test)]
-                                    if selected {
-                                        self.probe.selected_table_cell = Some(first_cell.rect);
-                                    }
-                                    clicked |= ui
-                                        .selectable_label(
-                                            selected,
-                                            format!("{:.4}", m.load_voltage_rms_v),
-                                        )
-                                        .clicked();
-                                    clicked |= ui
-                                        .selectable_label(
-                                            selected,
-                                            format!("{:.4}", m.load_power_w),
-                                        )
-                                        .clicked();
-                                    clicked |= ui
-                                        .selectable_label(
-                                            selected,
-                                            format!("{:.4}", m.input_current_rms_a),
-                                        )
-                                        .clicked();
-                                    clicked |= ui
-                                        .selectable_label(
-                                            selected,
-                                            format!(
-                                                "{:.3} {:+.3}j",
-                                                m.input_impedance_real_ohm,
-                                                m.input_impedance_imag_ohm
-                                            ),
-                                        )
-                                        .clicked();
-                                    clicked |= ui
-                                        .selectable_label(
-                                            selected,
-                                            m.reflection_magnitude
-                                                .map_or("—".into(), |g| format!("{g:.5}")),
-                                        )
-                                        .clicked();
-                                    clicked |= ui
-                                        .selectable_label(
-                                            selected,
-                                            RichText::new(format!(
-                                                "{:+.4}",
-                                                1e3 * m.input_admittance_real_s
-                                            ))
-                                            .color(
-                                                if m.input_admittance_real_s < 0.0 {
-                                                    ORANGE
-                                                } else {
-                                                    TEAL
-                                                },
-                                            ),
-                                        )
-                                        .clicked();
-                                    clicked |= ui
-                                        .selectable_label(
-                                            selected,
-                                            RichText::new(format!(
-                                                "{:.3}{}",
-                                                m.energy_balance_percent,
-                                                if m.quality_pass { "" } else { "  CHECK" }
-                                            ))
-                                            .color(
-                                                if m.quality_pass {
-                                                    Color32::LIGHT_GRAY
-                                                } else {
-                                                    ORANGE
-                                                },
-                                            ),
-                                        )
-                                        .clicked();
-                                    if clicked {
-                                        self.selected = Some(i);
-                                    }
-                                }
-                                Err(error) => {
-                                    ui.label(RichText::new("FAILED").color(ORANGE));
-                                    ui.label("Solver issue · hover for details")
-                                        .on_hover_text(error);
-                                    for _ in 0..6 {
-                                        ui.label("—");
-                                    }
-                                }
-                            }
-                            ui.end_row();
-                        }
-                    });
-            });
-        if let Some(i) = focus_row {
-            self.table_focused = Some((self.plot_generation, i));
-        }
-        #[cfg(test)]
-        {
-            self.probe.table_viewport = Some(table.inner_rect);
-        }
-        #[cfg(not(test))]
-        let _ = table;
-        ui.separator();
         let rows: Vec<_> = sweep
             .results
             .iter()
@@ -1867,54 +1708,52 @@ impl LabApp {
                 );
             }
             if let Some(check) = &m.resolution_check {
-                ui.label(
-                    RichText::new(
-                        check
-                            .trend
-                            .as_deref()
-                            .unwrap_or("Resolution check incomplete"),
-                    )
-                    .color(if m.quality_pass { TEAL } else { ORANGE })
-                    .strong(),
-                );
-                let mut stage = Some(check);
-                while let Some(comparison) = stage {
-                    let detail = comparison
-                        .differences_percent
-                        .iter()
-                        .map(|d| {
-                            format!(
-                                "{}: {}",
-                                d.metric,
-                                d.percent
-                                    .map_or("unavailable".into(), |v| format!("{v:.4}%"))
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    ui.label(format!(
-                        "{} → {} samples/period · max change {} · balance {:.3}% → {}",
-                        comparison.base_steps,
-                        comparison.refined_steps,
-                        comparison
-                            .max_difference_percent
-                            .map_or("n/a".into(), |v| format!("{v:.3}%")),
-                        comparison.base_balance_percent,
-                        comparison
-                            .refined_balance_percent
-                            .map_or("n/a".into(), |v| format!("{v:.3}%")),
-                    ))
-                    .on_hover_text(detail);
-                    if !m.quality_pass {
-                        for issue in &comparison.issues {
-                            ui.label(RichText::new(format!("CHECK · {issue}")).color(ORANGE));
+                egui::CollapsingHeader::new(
+                    RichText::new(check.trend.as_deref().unwrap_or("Resolution check incomplete"))
+                        .color(if m.quality_pass { TEAL } else { ORANGE })
+                        .strong(),
+                )
+                .id_salt(("resolution_details", self.plot_generation, self.selected))
+                .show(ui, |ui| {
+                    let mut stage = Some(check);
+                    while let Some(comparison) = stage {
+                        let detail = comparison
+                            .differences_percent
+                            .iter()
+                            .map(|d| {
+                                format!(
+                                    "{}: {}",
+                                    d.metric,
+                                    d.percent
+                                        .map_or("unavailable".into(), |v| format!("{v:.4}%"))
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        ui.label(format!(
+                            "{} → {} samples/period · max change {} · balance {:.3}% → {}",
+                            comparison.base_steps,
+                            comparison.refined_steps,
+                            comparison
+                                .max_difference_percent
+                                .map_or("n/a".into(), |v| format!("{v:.3}%")),
+                            comparison.base_balance_percent,
+                            comparison
+                                .refined_balance_percent
+                                .map_or("n/a".into(), |v| format!("{v:.3}%")),
+                        ))
+                        .on_hover_text(detail);
+                        if !m.quality_pass {
+                            for issue in &comparison.issues {
+                                ui.label(RichText::new(format!("CHECK · {issue}")).color(ORANGE));
+                            }
                         }
+                        stage = comparison.follow_up.as_deref();
                     }
-                    stage = comparison.follow_up.as_deref();
-                }
+                });
             }
         }
-        let height = ((ui.available_height() - 24.0) * 0.5).clamp(110.0, 320.0);
+        let height = (ui.available_height() * 0.28).clamp(145.0, 240.0);
         ui.small(
             "Click a sweep plot to select the nearest solved C1 point · failed points are skipped",
         );
@@ -2104,6 +1943,170 @@ impl LabApp {
             self.selected = Some(index);
             ui.ctx().request_repaint();
         }
+        ui.separator();
+        ui.label(RichText::new("Sweep points · click a row to inspect its waveform").strong());
+        let rows = sweep.results.len();
+        let focus_row = self
+            .selected
+            .filter(|&i| self.table_focused != Some((self.plot_generation, i)));
+        // Key the table's scroll state to the run so a previous run cannot hide
+        // the new column header or the newly selected row.
+        let mut table_scroll = egui::ScrollArea::both()
+            .id_salt(("sweep_table_scroll", self.plot_generation))
+            // Leave room for the outer analysis scrollbar on compact windows.
+            .max_width((ui.clip_rect().right() - ui.cursor().left() - 8.0).max(100.0))
+            .max_height(260.0)
+            .min_scrolled_height(220.0)
+            .animated(false)
+            .auto_shrink([false, false]);
+        if focus_row == Some(0) {
+            table_scroll = table_scroll.vertical_scroll_offset(0.0).horizontal_scroll_offset(0.0);
+        }
+        let table = table_scroll.show(ui, |ui| {
+                egui::Grid::new("sweep_table")
+                    .striped(true)
+                    .min_col_width(95.0)
+                    .show(ui, |ui| {
+                        for (column, title) in [
+                            "C each (µF)",
+                            "Load V rms",
+                            "Load W",
+                            "Input A rms",
+                            "Zin (Ω)",
+                            "|Γ|",
+                            "G total (mS)",
+                            "Balance %",
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let header = ui.strong(title);
+                            #[cfg(test)]
+                            if column == 0 {
+                                self.probe.table_header = Some(header.rect);
+                            }
+                            #[cfg(not(test))]
+                            let _ = (column, header);
+                        }
+                        ui.end_row();
+                        for i in 0..rows {
+                            match &sweep.results[i] {
+                                Ok(r) => {
+                                    let m = &r.metrics;
+                                    let selected = self.selected == Some(i);
+                                    let mut clicked = false;
+                                    let first_cell = ui.selectable_label(
+                                        selected,
+                                        RichText::new(format!(
+                                            "{}{:0.5}",
+                                            if selected { "▶ " } else { "" },
+                                            m.capacitance_each_uf
+                                        ))
+                                        .color(if selected { GOLD } else { Color32::LIGHT_GRAY })
+                                        .strong(),
+                                    );
+                                    clicked |= first_cell.clicked();
+                                    if focus_row == Some(i) && i != 0 {
+                                        ui.scroll_to_rect(first_cell.rect, None);
+                                    }
+                                    #[cfg(test)]
+                                    if selected {
+                                        self.probe.selected_table_cell = Some(first_cell.rect);
+                                    }
+                                    clicked |= ui
+                                        .selectable_label(
+                                            selected,
+                                            format!("{:.4}", m.load_voltage_rms_v),
+                                        )
+                                        .clicked();
+                                    clicked |= ui
+                                        .selectable_label(
+                                            selected,
+                                            format!("{:.4}", m.load_power_w),
+                                        )
+                                        .clicked();
+                                    clicked |= ui
+                                        .selectable_label(
+                                            selected,
+                                            format!("{:.4}", m.input_current_rms_a),
+                                        )
+                                        .clicked();
+                                    clicked |= ui
+                                        .selectable_label(
+                                            selected,
+                                            format!(
+                                                "{:.3} {:+.3}j",
+                                                m.input_impedance_real_ohm,
+                                                m.input_impedance_imag_ohm
+                                            ),
+                                        )
+                                        .clicked();
+                                    clicked |= ui
+                                        .selectable_label(
+                                            selected,
+                                            m.reflection_magnitude
+                                                .map_or("—".into(), |g| format!("{g:.5}")),
+                                        )
+                                        .clicked();
+                                    clicked |= ui
+                                        .selectable_label(
+                                            selected,
+                                            RichText::new(format!(
+                                                "{:+.4}",
+                                                1e3 * m.input_admittance_real_s
+                                            ))
+                                            .color(
+                                                if m.input_admittance_real_s < 0.0 {
+                                                    ORANGE
+                                                } else {
+                                                    TEAL
+                                                },
+                                            ),
+                                        )
+                                        .clicked();
+                                    clicked |= ui
+                                        .selectable_label(
+                                            selected,
+                                            RichText::new(format!(
+                                                "{:.3}{}",
+                                                m.energy_balance_percent,
+                                                if m.quality_pass { "" } else { "  CHECK" }
+                                            ))
+                                            .color(
+                                                if m.quality_pass {
+                                                    Color32::LIGHT_GRAY
+                                                } else {
+                                                    ORANGE
+                                                },
+                                            ),
+                                        )
+                                        .clicked();
+                                    if clicked {
+                                        self.selected = Some(i);
+                                    }
+                                }
+                                Err(error) => {
+                                    ui.label(RichText::new("FAILED").color(ORANGE));
+                                    ui.label("Solver issue · hover for details")
+                                        .on_hover_text(error);
+                                    for _ in 0..6 {
+                                        ui.label("—");
+                                    }
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if let Some(i) = focus_row {
+            self.table_focused = Some((self.plot_generation, i));
+        }
+        #[cfg(test)]
+        {
+            self.probe.table_viewport = Some(table.inner_rect);
+        }
+        #[cfg(not(test))]
+        let _ = table;
     }
 
     fn waveform(&self, ui: &mut egui::Ui) {
@@ -3576,6 +3579,7 @@ impl LabApp {
                             0
                         },
                         self.document,
+                        if self.tab == 0 { self.plot_generation } else { 0 },
                     ))
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.tab {
@@ -3664,6 +3668,12 @@ mod ui_tests {
         fn scroll_form_to_end(&mut self, size: [f32; 2]) {
             let scroll = self.app.probe.input_scroll.expect("form scroll area");
             self.wheel_at(size, scroll.center());
+        }
+
+        fn scroll_analysis_to_table(&mut self, size: [f32; 2]) {
+            let scroll = self.app.probe.analysis_viewport.expect("analysis scroll area");
+            self.wheel_at(size, egui::pos2(scroll.left() + 3.0, scroll.top() + 3.0));
+            self.pass(size, None);
         }
 
         fn wheel_at(&mut self, size: [f32; 2], pointer: egui::Pos2) {
@@ -4067,6 +4077,7 @@ mod ui_tests {
             new_bounds[1] >= 28.0,
             "new run still shows stale bounds: {new_bounds:?}"
         );
+        h.scroll_analysis_to_table(size);
         let header = h.app.probe.table_header.unwrap();
         let viewport = h.app.probe.table_viewport.unwrap();
         assert!(
@@ -4102,6 +4113,7 @@ mod ui_tests {
         let size = [1000.0, 680.0];
         h.pass(size, None);
         h.pass(size, None);
+        h.scroll_analysis_to_table(size);
         let viewport = h.app.probe.table_viewport.unwrap();
         h.wheel_at(size, viewport.center());
         h.pass(size, None);
@@ -4110,11 +4122,20 @@ mod ui_tests {
             old_header.bottom() < viewport.top(),
             "wheel didn't scroll table: {old_header:?} {viewport:?}"
         );
+        for _ in 0..4 {
+            h.pass(size, None); // Let the synthetic wheel event finish before a new run.
+        }
         h.app.plot_generation += 1;
         h.pass(size, None);
         h.pass(size, None);
+        assert!(h.app.probe.analysis_viewport.unwrap().intersects(
+            *h.app.probe.sweep_plot_transforms[0].unwrap().frame()
+        ), "a new run should open with the plots in view");
+        h.scroll_analysis_to_table(size);
         let header = h.app.probe.table_header.unwrap();
-        assert!(h.app.probe.table_viewport.unwrap().contains_rect(header));
+        assert!(h.app.probe.table_viewport.unwrap().contains_rect(header),
+            "header={header:?}, table={:?}, analysis={:?}",
+            h.app.probe.table_viewport, h.app.probe.analysis_viewport);
     }
 
     #[test]
@@ -4144,6 +4165,7 @@ mod ui_tests {
         h.app.selected = Some(0);
         h.pass(size, None);
         h.pass(size, None);
+        h.scroll_analysis_to_table(size);
         h.app.selected = Some(28); // Selection from another tab or a plot.
         h.pass(size, None);
         h.pass(size, None);
@@ -4248,6 +4270,13 @@ mod ui_tests {
             h.app.selected = Some(0);
             h.pass(size, None);
             h.pass(size, None);
+            let first_plot = h.app.probe.sweep_plot_transforms[0].unwrap();
+            let table = h.app.probe.table_viewport.unwrap();
+            assert!(first_plot.frame().top() < table.top(),
+                "sweep plots should appear before the table at {size:?}");
+            assert!(h.app.probe.analysis_viewport.unwrap().intersects(*first_plot.frame()),
+                "first sweep plot should be visible without scrolling at {size:?}");
+            h.scroll_analysis_to_table(size);
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
             for (name, rect) in [
                 ("header summary", h.app.probe.header_summary.unwrap()),
