@@ -375,6 +375,9 @@ struct LabApp {
     sweep: Option<Sweep>,
     /// Incremented after each completed run so plots never reuse zoom bounds from old data.
     plot_generation: u64,
+    /// Previous-frame plot geometry lets all four plots follow the same sampled hover point.
+    sweep_hover_generation: u64,
+    sweep_hover_transforms: [Option<egui_plot::PlotTransform>; 4],
     selected: Option<usize>,
     /// Only bring a row into view when selection changes; manual scrolling stays untouched.
     table_focused: Option<(u64, usize)>,
@@ -447,6 +450,8 @@ struct Probe {
     table_viewport: Option<egui::Rect>,
     table_header: Option<egui::Rect>,
     selected_table_cell: Option<egui::Rect>,
+    hovered_table_cell: Option<egui::Rect>,
+    hovered_sweep: Option<usize>,
     header_summary: Option<egui::Rect>,
     header_bar: Option<egui::Rect>,
     header_cards: [Option<egui::Rect>; 3],
@@ -535,6 +540,8 @@ impl LabApp {
             status_error: false,
             sweep: None,
             plot_generation: 0,
+            sweep_hover_generation: 0,
+            sweep_hover_transforms: [None; 4],
             selected: None,
             table_focused: None,
             output: None,
@@ -1597,6 +1604,11 @@ impl LabApp {
     }
 
     fn overview(&mut self, ui: &mut egui::Ui) {
+        #[cfg(test)]
+        {
+            self.probe.hovered_table_cell = None;
+            self.probe.hovered_sweep = None;
+        }
         let Some(sweep) = &self.sweep else {
             ui.add_space(24.0);
             ui.heading("Ready to explore a sweep");
@@ -1675,6 +1687,19 @@ impl LabApp {
             .iter()
             .filter_map(|r| r.as_ref().ok())
             .collect();
+        if self.sweep_hover_generation != self.plot_generation {
+            self.sweep_hover_generation = self.plot_generation;
+            self.sweep_hover_transforms = [None; 4];
+        }
+        let hovered_index = ui.ctx()
+            .input(|input| input.pointer.hover_pos())
+            .filter(|pos| ui.clip_rect().contains(*pos))
+            .and_then(|pos| hovered_sweep_index(pos, &self.sweep_hover_transforms, &sweep.results));
+        let hovered = hovered_index.and_then(|i| sweep.results[i].as_ref().ok());
+        #[cfg(test)]
+        {
+            self.probe.hovered_sweep = hovered_index;
+        }
         let selected = self
             .selected
             .and_then(|i| sweep.results.get(i)?.as_ref().ok());
@@ -1754,9 +1779,7 @@ impl LabApp {
             }
         }
         let height = (ui.available_height() * 0.28).clamp(145.0, 240.0);
-        ui.small(
-            "Click a sweep plot to select the nearest solved C1 point · failed points are skipped",
-        );
+        ui.small("Hover to compare the nearest computed point across plots and table · click to select · failed points are skipped");
         let mut clicked_x = None;
         ui.columns(2, |cols| {
             let (transform, x) = plot_metric(
@@ -1765,11 +1788,13 @@ impl LabApp {
                 height,
                 &rows,
                 selected,
+                hovered,
                 |m| m.load_voltage_rms_v,
                 TEAL,
                 self.plot_generation,
             );
             clicked_x = clicked_x.or(x);
+            self.sweep_hover_transforms[0] = Some(transform);
             #[cfg(test)]
             {
                 self.probe.voltage_plot_y_bounds =
@@ -1837,8 +1862,21 @@ impl LabApp {
                             }),
                             selected.map(|point| &point.metrics),
                         );
+                        mark_hovered_point(
+                            plot,
+                            hovered.map(|point| {
+                                let m = &point.metrics;
+                                (m, if observed.location == Location::Source {
+                                    m.source_power_w
+                                } else {
+                                    m.fundamental_active_power_w
+                                })
+                            }),
+                            selected.map(|point| &point.metrics),
+                        );
                     });
                 clicked_x = clicked_x.or(clicked_plot_x(&response));
+                self.sweep_hover_transforms[1] = Some(response.transform);
                 #[cfg(test)]
                 {
                     self.probe.sweep_plot_transforms[1] = Some(response.transform);
@@ -1851,11 +1889,13 @@ impl LabApp {
                     height,
                     &rows,
                     selected,
+                    hovered,
                     |m| m.load_power_w,
                     BLUE,
                     self.plot_generation,
                 );
                 clicked_x = clicked_x.or(x);
+                self.sweep_hover_transforms[1] = Some(transform);
                 #[cfg(test)]
                 {
                     self.probe.sweep_plot_transforms[1] = Some(transform);
@@ -1894,8 +1934,14 @@ impl LabApp {
                         selected.map(|point| point.metrics.input_admittance_real_s),
                         selected.map(|point| &point.metrics),
                     );
+                    mark_hovered_point(
+                        plot,
+                        hovered.map(|point| (&point.metrics, point.metrics.input_admittance_real_s)),
+                        selected.map(|point| &point.metrics),
+                    );
                 });
             clicked_x = clicked_x.or(clicked_plot_x(&response));
+            self.sweep_hover_transforms[2] = Some(response.transform);
             #[cfg(test)]
             {
                 self.probe.sweep_plot_transforms[2] = Some(response.transform);
@@ -1908,11 +1954,13 @@ impl LabApp {
                     height,
                     &rows,
                     selected,
+                    hovered,
                     |m| m.reflection_magnitude.unwrap_or(0.0),
                     TEAL,
                     self.plot_generation,
                 );
                 clicked_x = clicked_x.or(x);
+                self.sweep_hover_transforms[3] = Some(transform);
                 #[cfg(test)]
                 {
                     self.probe.sweep_plot_transforms[3] = Some(transform);
@@ -1926,11 +1974,13 @@ impl LabApp {
                     height,
                     &rows,
                     selected,
+                    hovered,
                     |m| m.input_current_rms_a,
                     TEAL,
                     self.plot_generation,
                 );
                 clicked_x = clicked_x.or(x);
+                self.sweep_hover_transforms[3] = Some(transform);
                 #[cfg(test)]
                 {
                     self.probe.sweep_plot_transforms[3] = Some(transform);
@@ -1994,15 +2044,17 @@ impl LabApp {
                                 Ok(r) => {
                                     let m = &r.metrics;
                                     let selected = self.selected == Some(i);
+                                    let hovered = hovered_index == Some(i);
+                                    let highlighted = selected || hovered;
                                     let mut clicked = false;
                                     let first_cell = ui.selectable_label(
-                                        selected,
+                                        highlighted,
                                         RichText::new(format!(
                                             "{}{:0.5}",
                                             if selected { "▶ " } else { "" },
                                             m.capacitance_each_uf
                                         ))
-                                        .color(if selected { GOLD } else { Color32::LIGHT_GRAY })
+                                        .color(if selected { GOLD } else if hovered { TEAL } else { Color32::LIGHT_GRAY })
                                         .strong(),
                                     );
                                     clicked |= first_cell.clicked();
@@ -2013,27 +2065,31 @@ impl LabApp {
                                     if selected {
                                         self.probe.selected_table_cell = Some(first_cell.rect);
                                     }
+                                    #[cfg(test)]
+                                    if hovered {
+                                        self.probe.hovered_table_cell = Some(first_cell.rect);
+                                    }
                                     clicked |= ui
                                         .selectable_label(
-                                            selected,
+                                            highlighted,
                                             format!("{:.4}", m.load_voltage_rms_v),
                                         )
                                         .clicked();
                                     clicked |= ui
                                         .selectable_label(
-                                            selected,
+                                            highlighted,
                                             format!("{:.4}", m.load_power_w),
                                         )
                                         .clicked();
                                     clicked |= ui
                                         .selectable_label(
-                                            selected,
+                                            highlighted,
                                             format!("{:.4}", m.input_current_rms_a),
                                         )
                                         .clicked();
                                     clicked |= ui
                                         .selectable_label(
-                                            selected,
+                                            highlighted,
                                             format!(
                                                 "{:.3} {:+.3}j",
                                                 m.input_impedance_real_ohm,
@@ -2043,14 +2099,14 @@ impl LabApp {
                                         .clicked();
                                     clicked |= ui
                                         .selectable_label(
-                                            selected,
+                                            highlighted,
                                             m.reflection_magnitude
                                                 .map_or("—".into(), |g| format!("{g:.5}")),
                                         )
                                         .clicked();
                                     clicked |= ui
                                         .selectable_label(
-                                            selected,
+                                            highlighted,
                                             RichText::new(format!(
                                                 "{:+.4}",
                                                 1e3 * m.input_admittance_real_s
@@ -2066,7 +2122,7 @@ impl LabApp {
                                         .clicked();
                                     clicked |= ui
                                         .selectable_label(
-                                            selected,
+                                            highlighted,
                                             RichText::new(format!(
                                                 "{:.3}{}",
                                                 m.energy_balance_percent,
@@ -2790,6 +2846,7 @@ fn plot_metric(
     height: f32,
     rows: &[&ResultPoint],
     selected: Option<&ResultPoint>,
+    hovered: Option<&ResultPoint>,
     value: impl Fn(&diode_plug_lab::solver::Metrics) -> f64,
     color: Color32,
     generation: u64,
@@ -2809,6 +2866,11 @@ fn plot_metric(
             mark_selected_point(
                 plot,
                 selected.map(|point| value(&point.metrics)),
+                selected.map(|point| &point.metrics),
+            );
+            mark_hovered_point(
+                plot,
+                hovered.map(|point| (&point.metrics, value(&point.metrics))),
                 selected.map(|point| &point.metrics),
             );
         });
@@ -2871,6 +2933,49 @@ fn mark_selected_point(
             );
         }
     }
+}
+
+/// A subdued cross-plot cursor; the persistent gold selection remains distinct.
+fn mark_hovered_point(
+    plot: &mut egui_plot::PlotUi<'_>,
+    hovered: Option<(&diode_plug_lab::solver::Metrics, f64)>,
+    selected: Option<&diode_plug_lab::solver::Metrics>,
+) {
+    let Some((metrics, y)) = hovered else {
+        return;
+    };
+    if selected.is_some_and(|s| s.capacitance_each_uf == metrics.capacitance_each_uf) {
+        return;
+    }
+    let x = metrics.capacitance_each_uf.log10();
+    let color = Color32::from_rgb(198, 217, 226);
+    plot.vline(
+        VLine::new("", x)
+            .color(color)
+            .width(1.0)
+            .style(LineStyle::dashed_dense())
+            .allow_hover(false),
+    );
+    if y.is_finite() {
+        plot.points(
+            Points::new("", vec![[x, y]])
+                .color(color)
+                .radius(4.0)
+                .allow_hover(false),
+        );
+    }
+}
+
+fn hovered_sweep_index(
+    pointer: egui::Pos2,
+    transforms: &[Option<egui_plot::PlotTransform>; 4],
+    results: &[Result<ResultPoint, String>],
+) -> Option<usize> {
+    transforms
+        .iter()
+        .flatten()
+        .find(|transform| transform.frame().contains(pointer))
+        .and_then(|transform| nearest_solved_index(results, transform.value_from_position(pointer).x))
 }
 
 fn sweep_hover(pos: &HoverPosition<'_>, rows: &[&ResultPoint]) -> Option<String> {
@@ -4143,6 +4248,61 @@ mod ui_tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn hovering_any_sweep_plot_highlights_the_same_computed_row_without_selecting() {
+        let circuit = Circuit::default();
+        let first = diode_plug_lab::solver::simulate(&circuit, 1.0, None).unwrap();
+        let mut last = first.clone();
+        last.metrics.capacitance_each_uf = 3.0;
+        last.metrics.capacitance_2_uf = 3.0;
+        let size = [1200.0, 1800.0];
+        for observed in [false, true] {
+            let mut config = default_config();
+            if observed {
+                config.observed_ac = Some(ObservedAc {
+                    location: Location::Source,
+                    voltage_rms_v: 24.0,
+                    capacitance_each_uf: 2.0,
+                    active_power_w: -1.0,
+                    reactive_power_var: None,
+                    note: String::new(),
+                });
+            }
+            let mut h = Harness::new();
+            h.app.sweep = Some(Sweep {
+                config,
+                effective_circuit: circuit.clone(),
+                results: vec![Ok(first.clone()), Err("failed".into()), Ok(last.clone())],
+                recommended_index: None,
+                observation_comparison: None,
+                fitted_return: None,
+                workers_used: 2,
+                engine: String::new(),
+                recorded_unix_ms: 0,
+            });
+            h.app.selected = Some(0);
+            h.pass(size, None);
+            h.pass(size, None);
+            for plot in 0..4 {
+                let transform = h.app.probe.sweep_plot_transforms[plot].unwrap();
+                let pointer = transform.position_from_point(&egui_plot::PlotPoint::new(
+                    2.0_f64.log10(),
+                    (transform.bounds().min()[1] + transform.bounds().max()[1]) * 0.5,
+                ));
+                h.pass(size, Some(pointer));
+                assert_eq!(h.app.probe.hovered_sweep, Some(2), "plot {plot}, observed={observed}");
+                assert!(h.app.probe.hovered_table_cell.is_some());
+                assert_eq!(h.app.selected, Some(0), "hover must not change selection");
+            }
+            h.pass(size, Some(egui::pos2(10.0, 10.0)));
+            assert_eq!(h.app.probe.hovered_sweep, None);
+            assert!(h.app.probe.hovered_table_cell.is_none());
+            h.app.plot_generation += 1;
+            h.pass(size, Some(egui::pos2(10.0, 10.0)));
+            assert_eq!(h.app.probe.hovered_sweep, None);
         }
     }
 
