@@ -3001,6 +3001,14 @@ fn scope_value(value: f64, unit: &str) -> String {
     }
 }
 
+fn scope_tooltip_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(Color32::from_rgb(20, 29, 36))
+        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(80, 108, 118)))
+        .corner_radius(0)
+        .inner_margin(egui::Margin::symmetric(10, 7))
+}
+
 fn scope_plot(
     ui: &mut egui::Ui,
     id: (&'static str, u64, Option<usize>),
@@ -3071,58 +3079,43 @@ fn scope_plot(
             nearest_trace_index(waveform, response.transform.value_from_position(pos).x)
         });
     if let Some(sample) = index.and_then(|i| waveform.get(i)) {
-        response.response.on_hover_ui_at_pointer(|ui| {
-            egui::Frame::new()
-                .fill(Color32::from_rgb(24, 35, 45))
-                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(85, 113, 126)))
-                .corner_radius(5)
-                .inner_margin(egui::Margin::symmetric(12, 8))
-                .show(ui, |ui| {
-                    ui.set_min_width(224.0);
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("MEASUREMENT CURSOR")
-                                .size(11.0)
-                                .color(TEAL)
-                                .strong(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.small("SAMPLE");
-                        });
-                    });
+        let mut tooltip = egui::Tooltip::for_enabled(&response.response).at_pointer().gap(12.0);
+        tooltip.popup = tooltip.popup.frame(scope_tooltip_frame());
+        tooltip.show(|ui| {
+            ui.set_min_width(250.0);
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("SAMPLE").size(11.0).strong().color(TEAL));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        RichText::new(format!("t = {:.4} ms", sample.time_s * 1e3))
-                            .font(FontId::monospace(15.0))
-                            .color(Color32::WHITE)
-                            .strong(),
-                    );
-                    ui.separator();
-                    for channel in channels {
-                        ui.horizontal(|ui| {
-                            let (dot, _) =
-                                ui.allocate_exact_size(egui::vec2(9.0, 16.0), egui::Sense::hover());
-                            ui.painter().circle_filled(dot.center(), 3.5, channel.color);
-                            ui.label(channel.name);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(scope_value((channel.value)(sample), unit))
-                                            .font(FontId::monospace(13.0))
-                                            .color(channel.color),
-                                    );
-                                },
-                            );
-                        });
-                    }
-                    ui.add_space(2.0);
-                    ui.label(
-                        RichText::new("NEAREST RECORDED SAMPLE · NOT INTERPOLATED")
-                            .size(10.0)
-                            .color(Color32::from_gray(150)),
+                        RichText::new(format!("{:.4} ms", sample.time_s * 1e3))
+                            .font(FontId::monospace(13.0))
+                            .color(Color32::WHITE),
                     );
                 });
+            });
+            ui.separator();
+            for channel in channels {
+                ui.horizontal(|ui| {
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(9.0, 16.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 3.5, channel.color);
+                    ui.label(channel.name);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(scope_value((channel.value)(sample), unit))
+                                .font(FontId::monospace(13.0))
+                                .color(channel.color),
+                        );
+                    });
+                });
+            }
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new("NEAREST RECORDED SAMPLE · NO INTERPOLATION")
+                    .size(10.0)
+                    .color(Color32::from_gray(150)),
+            );
         });
     }
     (response.transform, index)
@@ -4221,6 +4214,9 @@ mod ui_tests {
 
     #[test]
     fn energy_scope_cursor_uses_recorded_samples_and_readable_units() {
+        let frame = scope_tooltip_frame();
+        assert_eq!(frame.corner_radius, egui::CornerRadius::ZERO);
+        assert_eq!(frame.stroke.width, 1.0);
         assert_eq!(scope_value(0.0, "J"), "0.000 J");
         assert_eq!(scope_value(0.000_012_3, "J"), "12.300 µJ");
         assert_eq!(scope_value(0.000_000_000_2, "J"), "200.000 pJ");
