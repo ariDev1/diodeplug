@@ -1,0 +1,19 @@
+[package]
+name = "diode-plug-lab"
+version = "0.4.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+egui_plot = "0.38"
+egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark", "regex"] }
+egui_extras = { version = "0.37", default-features = false, features = ["svg"] }
+latex-rust = { version = "3.0.1", default-features = false, features = ["std"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+rayon = "1.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

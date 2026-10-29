@@ -1,0 +1,21 @@
+{
+  "circuit": {
+    "voltage_rms": 24,
+    "frequency": 50,
+    "resistance": 100,
+    "inductance": 0,
+    "load_capacitance": 0,
+    "source_resistance": 2,
+    "diode_drop": 0.7,
+    "diode_resistance": 1,
+    "load_model": { "kind": "linear" },
+    "ac_return": { "current_rms_a": 0.1, "phase_deg": 0 }
+  },
+  "capacitance_min_uf": 1,
+  "capacitance_max_uf": 10,
+  "points": 16,
+  "reference_ohms": 50,
+  "operator": "",
+  "run_id": "powered-return-example",
+  "workers": 0
+}

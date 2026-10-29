@@ -1,0 +1,19 @@
+{
+  "circuit": {
+    "voltage_rms": 24.0,
+    "frequency": 10000.0,
+    "resistance": 100.0,
+    "inductance": 0.0034,
+    "load_capacitance": 0.001,
+    "source_resistance": 0.9,
+    "diode_drop": 0.7,
+    "diode_resistance": 1.0
+  },
+  "capacitance_min_uf": 0.1,
+  "capacitance_max_uf": 10.0,
+  "points": 50,
+  "reference_ohms": 10.0,
+  "operator": "",
+  "run_id": "",
+  "workers": 0
+}
