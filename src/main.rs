@@ -1,4 +1,5 @@
 use diode_plug_lab::analysis;
+use diode_plug_lab::components::{DIODE_MODELS, DiodeModel};
 use diode_plug_lab::export;
 use diode_plug_lab::measurement;
 use diode_plug_lab::observed::{Location, ObservedAc};
@@ -842,8 +843,8 @@ const LABELS: [(&str, &str); 12] = [
     ("Load series L", "H"),
     ("Load parallel C", "F"),
     ("Source series Rs", "Ω"),
-    ("Diode forward Vf", "V"),
-    ("Diode dynamic Rd", "Ω"),
+    ("Diode Vf0", "V"),
+    ("Diode Rd", "Ω"),
     ("C1 minimum", "µF"),
     ("C1 maximum", "µF"),
     ("Sweep points", ""),
@@ -933,6 +934,23 @@ fn format_component(value: f64) -> String {
         text = text.trim_end_matches('0').trim_end_matches('.').to_owned();
     }
     text
+}
+
+fn diode_model_summary(model: &DiodeModel) -> String {
+    let qrr = if model.qrr_nc >= 1000.0 {
+        format!("{:.1} µC", model.qrr_nc / 1000.0)
+    } else {
+        format!("{:.0} nC", model.qrr_nc)
+    };
+    format!(
+        "{} V / {} A avg · Vf0 {:.2} V · Rd {:.2} Ω · Cj {:.0} pF · Qrr {}",
+        model.v_rrm_v,
+        model.i_f_avg_a,
+        model.vf0_v,
+        model.rd_ohm,
+        model.cj_f * 1e12,
+        qrr
+    )
 }
 
 fn select_component_unit(
@@ -2004,9 +2022,11 @@ impl LabApp {
             }
             ui.add_space(8.0);
             ui.heading(RichText::new("Source, load & diodes").size(16.0));
-            for i in 0..8 {
+            for i in 0..6 {
                 self.field(ui, i);
             }
+            ui.add_space(4.0);
+            self.diode_model_picker(ui);
             egui::ComboBox::from_label("Load branch model")
                 .selected_text(match self.model_kind {
                     0 => "Linear R–L || C",
@@ -2047,33 +2067,79 @@ impl LabApp {
                 });
                 ui.small("Requires junction capacitance Cj > 0; clamp-node transient becomes dynamic.");
             }
-            ui.checkbox(&mut self.cap_advanced, "Advanced capacitor & diode parasitics");
+            ui.checkbox(&mut self.cap_advanced, "Advanced · datasheet component data");
             if self.cap_advanced {
-                ui.horizontal(|ui| {
-                    ui.label("C2 ratio");
-                    ui.add(egui::TextEdit::singleline(&mut self.cap_ratio_form).desired_width(78.0));
-                    ui.small("C2 = ratio·C1");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("ESR");
-                    ui.add(egui::TextEdit::singleline(&mut self.cap_esr_form).desired_width(78.0));
-                    ui.label("Ω");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Leakage");
-                    ui.add(egui::TextEdit::singleline(&mut self.cap_leakage_form).desired_width(78.0));
-                    ui.label("Ω (blank = none)");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Diode Cj");
-                    ui.add(egui::TextEdit::singleline(&mut self.diode_cap_form).desired_width(78.0));
-                    component_unit_selector(ui, "diode_c_unit", &mut self.diode_cap_form,
-                        &mut self.component_units[DIODE_C_UNIT], Unit::Farad, &FARAD_UNITS);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Qrr");
-                    ui.add(egui::TextEdit::singleline(&mut self.diode_qrr_form).desired_width(78.0));
-                    ui.label("nC");
+                ui.indent("advanced_component_data", |ui| {
+                    ui.label(RichText::new("DIODE DATASHEET").size(10.0).color(MUTED));
+                    ui.small(
+                        "Vf0 is the zero-current intercept and Rd is the slope. Fit two datasheet points: Rd = ΔVf/ΔIf, Vf0 = Vf − If·Rd.",
+                    );
+                    self.field(ui, 6);
+                    self.field(ui, 7);
+                    ui.horizontal(|ui| {
+                        ui.label("Diode Cj");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.diode_cap_form)
+                                .desired_width(78.0),
+                        );
+                        component_unit_selector(
+                            ui,
+                            "diode_c_unit",
+                            &mut self.diode_cap_form,
+                            &mut self.component_units[DIODE_C_UNIT],
+                            Unit::Farad,
+                            &FARAD_UNITS,
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Qrr");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.diode_qrr_form)
+                                .desired_width(78.0),
+                        );
+                        ui.label("nC");
+                    });
+                    if !self.l_source_enabled {
+                        ui.label(
+                            RichText::new(
+                                "Cj is used only when Ls > 0. Without Ls the clamp node is treated as stiff.",
+                            )
+                            .small()
+                            .color(ORANGE),
+                        );
+                    }
+
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("PLUG CAPACITORS").size(10.0).color(MUTED));
+                    ui.small(
+                        "C1 is set above. C2 = ratio × C1. ESR and leakage are per capacitor.",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("C2 ratio");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.cap_ratio_form)
+                                .desired_width(78.0),
+                        );
+                        ui.small("C2 = ratio·C1");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("ESR");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.cap_esr_form).desired_width(78.0),
+                        );
+                        ui.label("Ω");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Leakage");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.cap_leakage_form)
+                                .desired_width(78.0),
+                        );
+                        ui.label("Ω (blank = none)");
+                    });
+                    ui.small(
+                        "Film: ESR 0.005–0.02 Ω, leakage ≥1 GΩ. Electrolytic: ESR 0.05–0.5 Ω, leakage ~0.1–1 MΩ.",
+                    );
                 });
             }
             ui.checkbox(&mut self.gate_enabled, "Pulsed (gated) load");
@@ -2216,6 +2282,76 @@ impl LabApp {
                 }
             }
         });
+    }
+
+    fn current_diode_model(&self) -> Option<usize> {
+        let vf0 = units::parse(&self.form[6], Unit::Volt, 1.0).ok()?;
+        let rd = units::parse(&self.form[7], Unit::Ohm, 1.0).ok()?;
+        let cj = component_value(
+            &self.diode_cap_form,
+            Unit::Farad,
+            self.component_units[DIODE_C_UNIT],
+            &FARAD_UNITS,
+        )
+        .ok()?;
+        let qrr = units::parse(&self.diode_qrr_form, Unit::Unitless, 1.0).ok()?;
+        DIODE_MODELS
+            .iter()
+            .position(|model| model.matches(vf0, rd, cj, qrr))
+    }
+
+    fn apply_diode_model(&mut self, index: usize) {
+        let Some(model) = DIODE_MODELS.get(index) else {
+            return;
+        };
+        self.form[6] = format_component(model.vf0_v);
+        self.form[7] = format_component(model.rd_ohm);
+        self.diode_cap_form =
+            format_component(model.cj_f / FARAD_UNITS[self.component_units[DIODE_C_UNIT]].scale);
+        self.diode_qrr_form = format_component(model.qrr_nc);
+        self.cap_advanced = true;
+        self.status = format!("Loaded diode data: {}", model.name);
+        self.status_error = false;
+    }
+
+    fn diode_model_picker(&mut self, ui: &mut egui::Ui) {
+        let mut current = self.current_diode_model();
+        let mut choice = current;
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [158.0, 22.0],
+                egui::Label::new("Diode model").halign(egui::Align::Min),
+            );
+            egui::ComboBox::from_id_salt("diode_model")
+                .selected_text(current.map_or("Custom / datasheet", |i| DIODE_MODELS[i].name))
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for (index, model) in DIODE_MODELS.iter().enumerate() {
+                        ui.selectable_value(&mut choice, Some(index), model.name);
+                    }
+                });
+        });
+        if choice != current
+            && let Some(index) = choice
+        {
+            self.apply_diode_model(index);
+            current = Some(index);
+        }
+        if let Some(index) = current {
+            let model = &DIODE_MODELS[index];
+            ui.label(
+                RichText::new(diode_model_summary(model))
+                    .small()
+                    .color(MUTED),
+            );
+        } else {
+            ui.label(
+                RichText::new("Choose a typical part, or enter datasheet values under Advanced.")
+                    .small()
+                    .color(MUTED),
+            );
+        }
+        ui.add_space(4.0);
     }
 
     fn update_live(&mut self, ctx: &egui::Context) {
@@ -6594,6 +6730,29 @@ mod ui_tests {
         h.app.form[4] = "0.47uF".into(); // Explicit suffix still wins.
         let circuit = h.app.read_live_circuit().unwrap();
         assert!((circuit.load_capacitance - 470e-9).abs() < 1e-18);
+    }
+
+    #[test]
+    fn diode_library_populates_advanced_datasheet_fields() {
+        let mut h = Harness::new();
+        h.app.live.playing = false;
+        let index = DIODE_MODELS
+            .iter()
+            .position(|model| model.name == "1N4007")
+            .expect("1N4007 model");
+        h.app.apply_diode_model(index);
+        assert!(h.app.cap_advanced);
+        assert_eq!(h.app.current_diode_model(), Some(index));
+
+        let circuit = h.app.read_live_circuit().unwrap();
+        assert!((circuit.diode_drop - 0.78).abs() < 1e-12);
+        assert!((circuit.diode_resistance - 0.10).abs() < 1e-12);
+        assert!((circuit.diode_capacitance_f - 15e-12).abs() < 1e-24);
+        assert!((circuit.diode_recovery_charge_nc - 2000.0).abs() < 1e-12);
+
+        // Editing a datasheet value switches the picker to Custom.
+        h.app.form[7] = "0.2".into();
+        assert_eq!(h.app.current_diode_model(), None);
     }
 
     #[test]

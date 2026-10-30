@@ -323,8 +323,8 @@ struct Layout {
 enum Drive {
     /// Original validated model: ideal voltage at node A set by the source algebra (2–3 states).
     Stiff,
-    /// Dynamic node A driven by an ideal source behind Rs and, when with_l, in series Ls.
-    Source { with_l: bool },
+    /// Dynamic node A driven by an ideal source behind Rs and a finite series Ls.
+    Source,
     /// Free-ringing parallel tank (L, C, loss G) connected to node A through the plug load.
     Tank { l: f64, c: f64, g: f64 },
 }
@@ -340,18 +340,16 @@ fn layout_for(mode: Drive, circuit: &Circuit) -> (Layout, usize) {
             },
             if has_il { 3 } else { 2 },
         ),
-        Drive::Source { with_l } => {
+        Drive::Source => {
             let mut next = 2;
             let il = has_il.then(|| {
                 let i = next;
                 next += 1;
                 i
             });
-            let coil = with_l.then(|| {
-                let i = next;
-                next += 1;
-                i
-            });
+            // Source mode always has a finite Ls; Cj alone no longer selects it.
+            let coil = Some(next);
+            next += 1;
             let va = next;
             (
                 Layout {
@@ -602,9 +600,7 @@ impl Context<'_> {
         }
         if let Some(i) = self.layout.coil {
             d[i] = match self.mode {
-                Drive::Source { with_l: true } => {
-                    (vs - c.source_resistance * s[i] - va) / c.source_inductance
-                }
+                Drive::Source => (vs - c.source_resistance * s[i] - va) / c.source_inductance,
                 Drive::Tank { l, .. } => va / l,
                 _ => 0.0,
             };
@@ -741,10 +737,11 @@ pub const LIVE_HISTORY_SAMPLES: usize = 16_384;
 const LIVE_SCOPE_SAMPLES_PER_CYCLE: usize = 3072;
 
 fn transient_context(circuit: &Circuit, cap_uf: f64, phase_offset: f64) -> Context<'_> {
+    // Cj is only meaningful as the clamp-node capacitance in the dynamic
+    // source-inductance mode. Without Ls the source fixes node A algebraically;
+    // using a tiny datasheet Cj there would force an unnecessarily stiff solve.
     let mode = if circuit.source_inductance > 0.0 {
-        Drive::Source { with_l: true }
-    } else if circuit.diode_capacitance_f > 0.0 {
-        Drive::Source { with_l: false }
+        Drive::Source
     } else {
         Drive::Stiff
     };
@@ -1087,13 +1084,10 @@ fn simulate_with_steps(
             * cap
             * (circuit.source_resistance + circuit.diode_resistance + circuit.capacitor_esr_ohm)))
         .ceil() as usize;
-    let mode = match (
-        circuit.source_inductance > 0.0,
-        circuit.diode_capacitance_f > 0.0,
-    ) {
-        (true, _) => Drive::Source { with_l: true },
-        (false, true) => Drive::Source { with_l: false },
-        (false, false) => Drive::Stiff,
+    let mode = if circuit.source_inductance > 0.0 {
+        Drive::Source
+    } else {
+        Drive::Stiff
     };
     let (layout, n) = layout_for(mode, circuit);
     let dynamic_steps = if mode == Drive::Stiff {
@@ -1197,7 +1191,7 @@ fn simulate_with_steps(
         let x_now = s[c1v];
         let y_now = s[c2v];
         let coil_energy = coil.map_or(0.0, |i| match mode {
-            Drive::Source { with_l: true } => 0.5 * circuit.source_inductance * s[i] * s[i],
+            Drive::Source => 0.5 * circuit.source_inductance * s[i] * s[i],
             Drive::Tank { l, .. } => 0.5 * l * s[i].powi(2),
             _ => 0.0,
         });
@@ -1312,7 +1306,7 @@ fn simulate_with_steps(
         let va_e = vai.map_or(0.0, |i| s[i]);
         let il_e = ilv.map_or(0.0, |i| 0.5 * circuit.inductance * s[i] * s[i]);
         let coil_e = coil.map_or(0.0, |i| match mode {
-            Drive::Source { with_l: true } => 0.5 * circuit.source_inductance * s[i] * s[i],
+            Drive::Source => 0.5 * circuit.source_inductance * s[i] * s[i],
             Drive::Tank { l, .. } => 0.5 * l * s[i] * s[i],
             _ => 0.0,
         });
@@ -1854,6 +1848,19 @@ mod tests {
         assert!(m.source_coil_current_rms_a > 0.0);
         assert!(m.source_coil_energy_swing_j > 0.0);
         assert_eq!(m.capacitance_2_uf, 10.0);
+    }
+
+    #[test]
+    fn datasheet_cj_without_source_inductance_uses_the_stiff_clamp_node() {
+        let mut c = circuit();
+        c.inductance = 0.0;
+        c.diode_capacitance_f = 15e-12;
+        c.source_inductance = 0.0;
+        let m = simulate(&c, 10.0, None).unwrap().metrics;
+        // The tiny junction capacitance must not force the dynamic node-A mode
+        // or its stiff timestep; the source fixes node A algebraically.
+        assert_eq!(m.source_coil_current_rms_a, 0.0);
+        assert!(m.energy_balance_percent < 1.0, "{m:?}");
     }
 
     #[test]
