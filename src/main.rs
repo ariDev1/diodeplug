@@ -21,10 +21,15 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const TEAL: Color32 = Color32::from_rgb(86, 187, 180);
-const BLUE: Color32 = Color32::from_rgb(117, 161, 224);
-const ORANGE: Color32 = Color32::from_rgb(229, 174, 110);
-const GOLD: Color32 = Color32::from_rgb(246, 211, 124);
+// EMWave instrument palette, translated from the bundled reference CSS.
+const PANEL: Color32 = Color32::from_rgb(18, 22, 29);
+const INPUT_BG: Color32 = Color32::from_rgb(11, 15, 22);
+const BORDER: Color32 = Color32::from_rgb(43, 49, 59);
+const MUTED: Color32 = Color32::from_rgb(137, 147, 161);
+const TEAL: Color32 = Color32::from_rgb(131, 255, 241);
+const BLUE: Color32 = Color32::from_rgb(143, 212, 255);
+const ORANGE: Color32 = Color32::from_rgb(230, 200, 110);
+const GOLD: Color32 = Color32::from_rgb(255, 238, 162);
 
 const DOCUMENTS: [(&str, &str); 2] = [
     ("Circuit theory", include_str!("../diode-plug_explained.md")),
@@ -332,6 +337,360 @@ enum Message {
     Finished(Box<Result<(Sweep, PathBuf, Duration), String>>),
 }
 
+/// The integrator is moved to a worker for each bounded chunk. On completion
+/// it returns with its state intact; UI edits are applied before the next chunk.
+struct LiveRun {
+    sender: Sender<(diode_plug_lab::solver::Transient, Result<(), String>)>,
+    receiver: Receiver<(diode_plug_lab::solver::Transient, Result<(), String>)>,
+    engine: Option<diode_plug_lab::solver::Transient>,
+    desired: Option<String>,
+    applied: Option<String>,
+    pending: bool,
+    playing: bool,
+    restart_requested: bool,
+    samples: Vec<diode_plug_lab::solver::Trace>,
+    time_s: f64,
+    last_dispatch: Instant,
+    error: Option<String>,
+    generation: u64,
+}
+
+impl LiveRun {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            sender,
+            receiver,
+            engine: None,
+            desired: None,
+            applied: None,
+            pending: false,
+            playing: true,
+            restart_requested: false,
+            samples: Vec::new(),
+            time_s: 0.0,
+            last_dispatch: Instant::now(),
+            error: None,
+            generation: 0,
+        }
+    }
+
+    fn restart(&mut self) {
+        self.restart_requested = self.pending;
+        self.engine = None;
+        self.applied = None;
+        self.samples.clear();
+        self.time_s = 0.0;
+        self.error = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn receive(&mut self) {
+        while let Ok((engine, result)) = self.receiver.try_recv() {
+            self.pending = false;
+            if self.restart_requested {
+                self.restart_requested = false;
+                continue;
+            }
+            match result {
+                Ok(()) => {
+                    self.time_s = engine.time_s();
+                    self.samples = engine.waveform();
+                }
+                Err(error) => {
+                    self.error = Some(error);
+                    self.playing = false;
+                }
+            }
+            self.engine = Some(engine);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TriggerSource {
+    SourceV,
+    PortV,
+    LoadV,
+    InputA,
+    LoadA,
+}
+
+impl TriggerSource {
+    fn name(self) -> &'static str {
+        match self {
+            Self::SourceV => "Source V",
+            Self::PortV => "Port V",
+            Self::LoadV => "Load V",
+            Self::InputA => "Input A",
+            Self::LoadA => "Load A",
+        }
+    }
+    fn unit(self) -> &'static str {
+        match self {
+            Self::SourceV | Self::PortV | Self::LoadV => "V",
+            _ => "A",
+        }
+    }
+    fn value(self, sample: &diode_plug_lab::solver::Trace) -> f64 {
+        match self {
+            Self::SourceV => sample.source_v,
+            Self::PortV => sample.port_v,
+            Self::LoadV => sample.load_v,
+            Self::InputA => sample.input_a,
+            Self::LoadA => sample.load_a,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TriggerEdge {
+    Rising,
+    Falling,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TriggerMode {
+    Auto,
+    Normal,
+    Single,
+}
+
+const TRIGGER_WINDOW: usize = 512;
+const MAX_TRIGGER_WINDOW: usize = diode_plug_lab::solver::LIVE_HISTORY_SAMPLES / 2;
+const SCOPE_DIVISIONS: f64 = 10.0;
+
+fn timebase_unit(ms_div: f64) -> (f64, &'static str) {
+    if ms_div < 1e-3 {
+        (1e6, "ns/div")
+    } else if ms_div < 1.0 {
+        (1e3, "µs/div")
+    } else if ms_div < 1e3 {
+        (1.0, "ms/div")
+    } else {
+        (1e-3, "s/div")
+    }
+}
+
+struct ScopeTimebase {
+    window: usize,
+    ms_div: f64,
+    min_ms_div: f64,
+    max_ms_div: f64,
+    limited: bool,
+}
+
+fn scope_timebase(
+    sample_dt: f64,
+    frequency: f64,
+    gate_hz: Option<f64>,
+    requested_ms_div: f64,
+) -> ScopeTimebase {
+    let min_ms_div = sample_dt * 64.0 * 1e3 / SCOPE_DIVISIONS;
+    let max_ms_div = sample_dt * MAX_TRIGGER_WINDOW as f64 * 1e3 / SCOPE_DIVISIONS;
+    let target_hz = gate_hz
+        .filter(|hz| *hz > 0.0 && hz.is_finite())
+        .map_or(frequency, |hz| hz.min(frequency));
+    let target_ms_div = if requested_ms_div.is_finite() && requested_ms_div > 0.0 {
+        requested_ms_div
+    } else {
+        2e3 / (SCOPE_DIVISIONS * target_hz)
+    };
+    let limited = target_ms_div > max_ms_div;
+    let window = (target_ms_div * SCOPE_DIVISIONS / (sample_dt * 1e3)).round() as usize;
+    let window = window.clamp(64, MAX_TRIGGER_WINDOW);
+    ScopeTimebase {
+        window,
+        ms_div: window as f64 * sample_dt * 1e3 / SCOPE_DIVISIONS,
+        min_ms_div,
+        max_ms_div,
+        limited,
+    }
+}
+
+struct LiveScopeSettings {
+    voltage: [bool; 3],
+    current: [bool; 6],
+    auto_timebase: bool,
+    timebase_ms_div: f64,
+    auto_voltage: bool,
+    voltage_v_div: f64,
+    auto_current: bool,
+    current_a_div: f64,
+}
+
+impl LiveScopeSettings {
+    fn new() -> Self {
+        Self {
+            voltage: [true; 3],
+            current: [true; 6],
+            auto_timebase: true,
+            timebase_ms_div: 0.01,
+            auto_voltage: true,
+            voltage_v_div: 10.0,
+            auto_current: true,
+            current_a_div: 1.0,
+        }
+    }
+
+    fn trigger_visible(&self, source: TriggerSource) -> bool {
+        match source {
+            TriggerSource::SourceV => self.voltage[0],
+            TriggerSource::PortV => self.voltage[1],
+            TriggerSource::LoadV => self.voltage[2],
+            TriggerSource::InputA => self.current[0],
+            TriggerSource::LoadA => self.current[1],
+        }
+    }
+}
+
+struct TriggerCapture {
+    samples: Vec<diode_plug_lab::solver::Trace>,
+    time_s: f64,
+}
+
+struct LiveTrigger {
+    source: TriggerSource,
+    edge: TriggerEdge,
+    level: f64,
+    holdoff_ms: f64,
+    window_samples: usize,
+    mode: TriggerMode,
+    armed: bool,
+    capture: Option<TriggerCapture>,
+    last_time_s: Option<f64>,
+    count: usize,
+}
+
+impl LiveTrigger {
+    fn observed_range(&self, samples: &[diode_plug_lab::solver::Trace]) -> Option<(f64, f64)> {
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for sample in samples {
+            let value = self.source.value(sample);
+            if value.is_finite() {
+                min = min.min(value);
+                max = max.max(value);
+            }
+        }
+        (min <= max).then_some((min, max))
+    }
+
+    fn set_mid_level(&mut self, samples: &[diode_plug_lab::solver::Trace]) -> bool {
+        if let Some((min, max)) = self.observed_range(samples)
+            && min < max
+        {
+            self.level = min + (max - min) / 2.0;
+            return true;
+        }
+        false
+    }
+
+    fn new() -> Self {
+        Self {
+            source: TriggerSource::SourceV,
+            edge: TriggerEdge::Rising,
+            level: 0.0,
+            holdoff_ms: 0.0,
+            window_samples: TRIGGER_WINDOW,
+            mode: TriggerMode::Auto,
+            armed: true,
+            capture: None,
+            last_time_s: None,
+            count: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.capture = None;
+        self.last_time_s = None;
+        self.count = 0;
+        self.armed = true;
+    }
+
+    /// Trigger only after a full post-trigger window is available. Select the
+    /// newest fresh crossing to keep the displayed scope aligned and current.
+    fn update(&mut self, samples: &[diode_plug_lab::solver::Trace]) {
+        let window = self.window_samples.clamp(64, MAX_TRIGGER_WINDOW);
+        let pre = window / 4;
+        if !self.armed
+            || samples.len() < window
+            || !self.level.is_finite()
+            || !self.holdoff_ms.is_finite()
+            || self.holdoff_ms < 0.0
+        {
+            return;
+        }
+        let last = samples.len() - (window - pre);
+        let fresh = (pre..=last).rev().find(|&i| {
+            let a = self.source.value(&samples[i - 1]);
+            let b = self.source.value(&samples[i]);
+            let crossed = match self.edge {
+                // A unipolar charging pulse can sit exactly at 0 between
+                // conduction intervals. Count 0→positive once, not never.
+                TriggerEdge::Rising => a <= self.level && b > self.level,
+                TriggerEdge::Falling => a > self.level && b <= self.level,
+            };
+            crossed
+                && a.is_finite()
+                && b.is_finite()
+                && self
+                    .last_time_s
+                    .is_none_or(|t| samples[i].time_s > t + self.holdoff_ms * 1e-3)
+        });
+        if let Some(i) = fresh {
+            let a = self.source.value(&samples[i - 1]);
+            let b = self.source.value(&samples[i]);
+            let fraction = (self.level - a) / (b - a);
+            let time_s =
+                samples[i - 1].time_s + fraction * (samples[i].time_s - samples[i - 1].time_s);
+            let start = i - pre;
+            self.capture = Some(TriggerCapture {
+                samples: samples[start..start + window].to_vec(),
+                time_s,
+            });
+            self.last_time_s = Some(samples[i].time_s);
+            self.count += 1;
+            if self.mode == TriggerMode::Single {
+                self.armed = false;
+            }
+        }
+        if self.mode == TriggerMode::Auto
+            && let (Some(capture), Some(latest)) = (&self.capture, samples.last())
+        {
+            let window_s = capture.samples.last().unwrap().time_s - capture.samples[0].time_s;
+            if latest.time_s - capture.time_s > 2.0 * window_s {
+                self.capture = None; // AUTO returns to a moving scope if the signal stops crossing.
+            }
+        }
+    }
+
+    fn status(&self) -> String {
+        if self.mode == TriggerMode::Single && !self.armed {
+            return format!(
+                "SINGLE CAPTURED · #{}, simulation continues · Re-arm to capture again",
+                self.count
+            );
+        }
+        if let Some(capture) = &self.capture {
+            format!(
+                "TRIGGERED · #{} at {:.6} s{}",
+                self.count,
+                capture.time_s,
+                if self.mode == TriggerMode::Normal {
+                    " · holding until next edge"
+                } else {
+                    ""
+                }
+            )
+        } else if self.mode == TriggerMode::Auto {
+            "AUTO · free-running until an edge is captured".into()
+        } else {
+            "WAITING FOR TRIGGER · no capture yet (integration continues)".into()
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RunPerformance {
     compute_time: Duration,
@@ -383,6 +742,10 @@ struct LabApp {
     table_focused: Option<(u64, usize)>,
     output: Option<PathBuf>,
     tab: usize,
+    live_cap_uf: f64,
+    live: LiveRun,
+    trigger: LiveTrigger,
+    scope: LiveScopeSettings,
     preset: Option<usize>,
     reset_pending: bool,
     document: usize,
@@ -466,6 +829,9 @@ struct Probe {
     sweep_plot_transforms: [Option<egui_plot::PlotTransform>; 4],
     voltage_plot_y_bounds: Option<[f64; 2]>,
     voltage_plot_transform: Option<egui_plot::PlotTransform>,
+    live_voltage_bounds: Option<([f64; 2], [f64; 2])>,
+    live_voltage_frame: Option<egui::Rect>,
+    live_channel_counts: Option<(usize, usize)>,
 }
 
 const LABELS: [(&str, &str); 12] = [
@@ -502,11 +868,17 @@ impl LabApp {
         style
             .text_styles
             .insert(TextStyle::Small, FontId::proportional(12.0));
-        style.visuals.panel_fill = Color32::from_rgb(17, 22, 27);
-        style.visuals.extreme_bg_color = Color32::from_rgb(12, 17, 22);
-        style.visuals.faint_bg_color = Color32::from_rgb(23, 32, 39);
-        style.visuals.widgets.active.bg_fill = Color32::from_rgb(27, 100, 108);
-        style.visuals.selection.bg_fill = Color32::from_rgb(21, 91, 103);
+        style.visuals.panel_fill = PANEL;
+        style.visuals.extreme_bg_color = INPUT_BG;
+        style.visuals.faint_bg_color = Color32::from_rgb(21, 26, 34);
+        style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(23, 28, 36);
+        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(32, 39, 51);
+        style.visuals.widgets.hovered.bg_stroke =
+            egui::Stroke::new(1.0, Color32::from_rgb(89, 98, 115));
+        style.visuals.widgets.active.bg_fill = Color32::from_rgb(15, 20, 27);
+        style.visuals.selection.bg_fill = Color32::from_rgb(34, 68, 82);
         egui_ctx.set_style_of(egui::Theme::Dark, style);
         let c = default_config();
         let values = [
@@ -545,7 +917,11 @@ impl LabApp {
             selected: None,
             table_focused: None,
             output: None,
-            tab: 0,
+            tab: 7,
+            live_cap_uf: 1.0,
+            live: LiveRun::new(),
+            trigger: LiveTrigger::new(),
+            scope: LiveScopeSettings::new(),
             preset: None,
             reset_pending: false,
             document: 0,
@@ -659,7 +1035,7 @@ impl LabApp {
         self.cap_leakage_form = c
             .circuit
             .capacitor_leakage_parallel_ohm
-            .map_or(String::new(), |r| format!("{}MegOhm", r / 1e6));
+            .map_or(String::new(), |r| format!("{}MOhm", r / 1e6));
         self.diode_cap_form = format!("{}pF", c.circuit.diode_capacitance_f * 1e12);
         self.diode_qrr_form = format!("{}", c.circuit.diode_recovery_charge_nc);
         self.gate_enabled = c.circuit.pulse_gate.is_some();
@@ -930,6 +1306,14 @@ impl LabApp {
     }
 
     fn read_config(&self) -> Result<Config, String> {
+        self.read_config_with_mode(false)
+    }
+
+    fn read_live_circuit(&self) -> Result<Circuit, String> {
+        Ok(self.read_config_with_mode(true)?.circuit)
+    }
+
+    fn read_config_with_mode(&self, live: bool) -> Result<Config, String> {
         let mut v = [0.0; 12];
         let units = [
             Unit::Volt,
@@ -943,7 +1327,7 @@ impl LabApp {
             Unit::Farad,
             Unit::Farad,
         ];
-        for i in 0..10 {
+        for i in 0..if live { 8 } else { 10 } {
             let scale = if i == 8 || i == 9 { 1e-6 } else { 1.0 };
             let value = units::parse(&self.form[i], units[i], scale)
                 .map_err(|e| format!("{}: {e}", LABELS[i].0))?;
@@ -953,15 +1337,27 @@ impl LabApp {
                 value
             };
         }
-        let points = self.form[10]
-            .trim()
-            .parse::<usize>()
-            .map_err(|_| "Sweep points must be an integer")?;
-        let workers = self.form[11]
-            .trim()
-            .parse::<usize>()
-            .map_err(|_| "Workers must be a nonnegative integer")?;
-        let reference = if self.reference.trim().is_empty() {
+        if live {
+            v[8] = 0.1;
+            v[9] = 10.0;
+        }
+        let points = if live {
+            2
+        } else {
+            self.form[10]
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "Sweep points must be an integer")?
+        };
+        let workers = if live {
+            0
+        } else {
+            self.form[11]
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "Workers must be a nonnegative integer")?
+        };
+        let reference = if live || self.reference.trim().is_empty() {
             None
         } else {
             Some(
@@ -997,7 +1393,7 @@ impl LabApp {
         } else {
             None
         };
-        let observed_ac = if self.observed_enabled {
+        let observed_ac = if self.observed_enabled && !live {
             Some(ObservedAc {
                 location: self.observed_location,
                 voltage_rms_v: units::parse(&self.observed_voltage, Unit::Volt, 1.0)
@@ -1094,7 +1490,7 @@ impl LabApp {
             workers,
             reference_ohms: reference,
             observed_ac,
-            fit_to_observed_power: self.observed_enabled && self.fit_observed,
+            fit_to_observed_power: !live && self.observed_enabled && self.fit_observed,
             operator: self.config.operator.clone(),
             run_id: self.config.run_id.clone(),
         };
@@ -1117,6 +1513,7 @@ impl LabApp {
             return;
         }
         self.config = config.clone();
+        self.tab = 0;
         self.sweep = None;
         self.output = None;
         self.selected = None;
@@ -1249,8 +1646,28 @@ impl LabApp {
             self.probe.status_bar = Some(ui.max_rect());
         }
         ui.horizontal(|ui| {
-            let indicator = if self.status_error {
+            let live = self.tab == 7;
+            let live_status = if let Some(error) = &self.live.error {
+                format!("Live input · {error}")
+            } else if !self.live.samples.is_empty() {
+                "Live time-domain run · not lab-validated".into()
+            } else {
+                "Live time-domain · starting from zero".into()
+            };
+            let status = if live { &live_status } else { &self.status };
+            let status_error = if live {
+                self.live.error.is_some()
+            } else {
+                self.status_error
+            };
+            let indicator = if status_error {
                 ORANGE
+            } else if live {
+                if !self.live.samples.is_empty() {
+                    TEAL
+                } else {
+                    BLUE
+                }
             } else if self.running {
                 ORANGE
             } else if self.performance.is_some() {
@@ -1265,19 +1682,30 @@ impl LabApp {
             let response = ui
                 .add_sized(
                     [status_width, 18.0],
-                    egui::Label::new(RichText::new(&self.status).color(if self.status_error {
+                    egui::Label::new(RichText::new(status).color(if status_error {
                         ORANGE
                     } else {
                         Color32::LIGHT_GRAY
                     }))
                     .truncate(),
                 )
-                .on_hover_text(self.output.as_ref().map_or_else(
-                    || self.status.clone(),
-                    |path| format!("{}\nResults: {}", self.status, path.display()),
-                ));
+                .on_hover_text(if live {
+                    live_status.clone()
+                } else {
+                    self.output.as_ref().map_or_else(
+                        || self.status.clone(),
+                        |path| format!("{}\nResults: {}", self.status, path.display()),
+                    )
+                });
             self.probe.run_status = Some(response.rect);
-            let (fraction, progress_text, performance) = if self.running {
+            let (fraction, progress_text, performance) = if live {
+                (
+                    0.0,
+                    "Live".into(),
+                    "Preview recomputes after edits · sweep data is saved only with Run sweep"
+                        .into(),
+                )
+            } else if self.running {
                 let elapsed = self
                     .started_at
                     .map_or(0.0, |start| start.elapsed().as_secs_f64());
@@ -1389,13 +1817,14 @@ impl LabApp {
             .show(ui, |ui| {
             let presets = presets::all();
             let mut choice = self.preset;
-            egui::ComboBox::from_label("Lab preset")
+            ui.label(RichText::new("LAB PRESET").size(10.0).color(MUTED));
+            egui::ComboBox::from_id_salt("lab_preset")
                 .selected_text(
                     choice
                         .and_then(|i| presets.get(i).map(|p| p.name))
                         .unwrap_or("Custom / select example"),
                 )
-                .width(275.0)
+                .width(ui.available_width().min(310.0) - 20.0)
                 .show_ui(ui, |ui| {
                     for (i, p) in presets.iter().enumerate() {
                         ui.selectable_value(&mut choice, Some(i), p.name);
@@ -1603,6 +2032,458 @@ impl LabApp {
         });
     }
 
+    fn update_live(&mut self, ctx: &egui::Context) {
+        let input = self.read_live_circuit().and_then(|circuit| {
+            if !self.live_cap_uf.is_finite() || self.live_cap_uf <= 0.0 {
+                return Err("Live C1 must be a positive, finite capacitance".into());
+            }
+            let key = serde_json::to_string(&(&circuit, self.live_cap_uf))
+                .map_err(|error| error.to_string())?;
+            Ok((key, circuit))
+        });
+        self.live.receive();
+        let (key, circuit) = match input {
+            Ok(input) => input,
+            Err(error) => {
+                self.live.desired = None;
+                self.live.error = Some(error);
+                return;
+            }
+        };
+        self.live.desired = Some(key.clone());
+        if self.live.pending {
+            // The in-flight chunk completes with its old circuit. It will be
+            // reconfigured at the same simulation time before another step.
+            if self.live.applied.as_deref() != Some(&key) {
+                ctx.request_repaint_after(Duration::from_millis(25));
+            }
+            return;
+        }
+        if self.live.engine.is_none() {
+            match diode_plug_lab::solver::Transient::new(circuit.clone(), self.live_cap_uf) {
+                Ok(engine) => {
+                    self.live.samples = engine.waveform();
+                    self.live.engine = Some(engine);
+                    self.live.time_s = 0.0;
+                    self.live.applied = Some(key.clone());
+                    self.live.error = None;
+                }
+                Err(error) => {
+                    self.live.error = Some(error);
+                    return;
+                }
+            }
+        } else if self.live.applied.as_deref() != Some(&key) {
+            match self
+                .live
+                .engine
+                .as_mut()
+                .unwrap()
+                .reconfigure(circuit, self.live_cap_uf)
+            {
+                Ok(()) => {
+                    self.live.applied = Some(key);
+                    self.live.error = None;
+                }
+                Err(error) => {
+                    self.live.error = Some(error);
+                    return;
+                }
+            }
+        }
+        if self.live.playing && self.live.error.is_none() {
+            let elapsed = self.live.last_dispatch.elapsed();
+            if elapsed < Duration::from_millis(30) {
+                ctx.request_repaint_after(Duration::from_millis(30) - elapsed);
+                return;
+            }
+            let mut engine = self.live.engine.take().unwrap();
+            self.live.pending = true;
+            self.live.last_dispatch = Instant::now();
+            let tx = self.live.sender.clone();
+            let repaint = ctx.clone();
+            std::thread::spawn(move || {
+                let result = engine.advance(128);
+                let _ = tx.send((engine, result));
+                repaint.request_repaint();
+            });
+        }
+    }
+
+    fn live_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("LIVE · TIME-DOMAIN INTEGRATION")
+                    .color(BLUE)
+                    .strong(),
+            );
+            if ui
+                .button(if self.live.playing { "Pause" } else { "Play" })
+                .clicked()
+            {
+                self.live.playing = !self.live.playing;
+                if self.live.playing {
+                    self.live.error = None;
+                }
+            }
+            if ui.button("Restart from zero").clicked() {
+                self.live.restart();
+                self.trigger.reset();
+            }
+        });
+        ui.small("Integrates forward from zero-energy startup. Edits continue from the current state; no run is saved.");
+        let range = units::parse(&self.form[8], Unit::Farad, 1e-6)
+            .ok()
+            .zip(units::parse(&self.form[9], Unit::Farad, 1e-6).ok())
+            .map(|(min, max)| (min * 1e6, max * 1e6))
+            .filter(|(min, max)| *min > 0.0 && max > min);
+        if let Some((min, max)) = range {
+            ui.add(
+                egui::Slider::new(&mut self.live_cap_uf, min..=max)
+                    .logarithmic(true)
+                    .text("C1 (µF)"),
+            );
+        } else {
+            ui.label(RichText::new("Enter a valid sweep range to adjust live C1.").color(ORANGE));
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("TRIGGER").color(BLUE).strong());
+            let mut changed = false;
+            let old_source = self.trigger.source;
+            egui::ComboBox::from_id_salt("live_trigger_source")
+                .selected_text(self.trigger.source.name())
+                .show_ui(ui, |ui| {
+                    for source in [
+                        TriggerSource::SourceV,
+                        TriggerSource::PortV,
+                        TriggerSource::LoadV,
+                        TriggerSource::InputA,
+                        TriggerSource::LoadA,
+                    ] {
+                        changed |= ui
+                            .selectable_value(&mut self.trigger.source, source, source.name())
+                            .changed();
+                    }
+                });
+            if self.trigger.source != old_source {
+                // A load voltage can remain positive throughout charging;
+                // a 0 V default would never be crossed on that channel.
+                self.trigger.set_mid_level(&self.live.samples);
+            }
+            egui::ComboBox::from_id_salt("live_trigger_edge")
+                .selected_text(if self.trigger.edge == TriggerEdge::Rising {
+                    "↗ Rising"
+                } else {
+                    "↘ Falling"
+                })
+                .show_ui(ui, |ui| {
+                    changed |= ui
+                        .selectable_value(&mut self.trigger.edge, TriggerEdge::Rising, "↗ Rising")
+                        .changed();
+                    changed |= ui
+                        .selectable_value(&mut self.trigger.edge, TriggerEdge::Falling, "↘ Falling")
+                        .changed();
+                });
+            ui.label("Level");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.trigger.level)
+                        .speed(if self.trigger.source.unit() == "V" {
+                            0.1
+                        } else {
+                            0.01
+                        })
+                        .range(-1e9..=1e9)
+                        .suffix(format!(" {}", self.trigger.source.unit())),
+                )
+                .changed();
+            if ui
+                .button("Mid-level")
+                .on_hover_text("Set level halfway through the observed signal range")
+                .clicked()
+            {
+                changed |= self.trigger.set_mid_level(&self.live.samples);
+            }
+            egui::ComboBox::from_id_salt("live_trigger_mode")
+                .selected_text(match self.trigger.mode {
+                    TriggerMode::Auto => "Auto",
+                    TriggerMode::Normal => "Normal",
+                    TriggerMode::Single => "Single",
+                })
+                .show_ui(ui, |ui| {
+                    for (mode, label) in [
+                        (TriggerMode::Auto, "Auto"),
+                        (TriggerMode::Normal, "Normal"),
+                        (TriggerMode::Single, "Single"),
+                    ] {
+                        changed |= ui
+                            .selectable_value(&mut self.trigger.mode, mode, label)
+                            .changed();
+                    }
+                });
+            ui.label("Holdoff");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.trigger.holdoff_ms)
+                        .speed(0.01)
+                        .range(0.0..=1e6)
+                        .suffix(" ms"),
+                )
+                .changed();
+            if changed {
+                self.trigger.reset();
+                self.trigger.last_time_s = Some(self.live.time_s);
+            }
+            if self.trigger.mode == TriggerMode::Single
+                && !self.trigger.armed
+                && ui.button("Re-arm").clicked()
+            {
+                self.trigger.armed = true;
+                self.trigger.capture = None;
+                self.trigger.last_time_s = Some(self.live.time_s);
+            }
+        });
+        let live_circuit = self.read_live_circuit().ok();
+        let frequency = live_circuit.as_ref().map_or(50.0, |c| c.frequency);
+        let gate_hz = live_circuit
+            .as_ref()
+            .and_then(|c| c.pulse_gate.as_ref())
+            .map(|gate| gate.repetition_hz);
+        let sample_dt = self
+            .live
+            .samples
+            .windows(2)
+            .last()
+            .map(|pair| pair[1].time_s - pair[0].time_s)
+            .filter(|dt| dt.is_finite() && *dt > 0.0)
+            .or_else(|| live_circuit.as_ref().map(|c| 1.0 / (512.0 * c.frequency)))
+            .unwrap_or(1e-6);
+        let automatic = scope_timebase(sample_dt, frequency, gate_hz, 0.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("SCOPE").color(BLUE).strong());
+            let previous_auto = self.scope.auto_timebase;
+            ui.checkbox(&mut self.scope.auto_timebase, "Auto timebase");
+            if previous_auto && !self.scope.auto_timebase {
+                self.scope.timebase_ms_div = automatic.ms_div;
+            }
+            if !self.scope.auto_timebase {
+                self.scope.timebase_ms_div = self
+                    .scope
+                    .timebase_ms_div
+                    .clamp(automatic.min_ms_div, automatic.max_ms_div);
+                ui.label("Horizontal");
+                let (scale, unit) = timebase_unit(self.scope.timebase_ms_div);
+                let mut displayed = self.scope.timebase_ms_div * scale;
+                ui.add(
+                    egui::Slider::new(
+                        &mut displayed,
+                        automatic.min_ms_div * scale..=automatic.max_ms_div * scale,
+                    )
+                    .logarithmic(true)
+                    .suffix(format!(" {unit}")),
+                )
+                .on_hover_text(
+                    "10 horizontal divisions; drag to show more or fewer simulated cycles",
+                );
+                self.scope.timebase_ms_div = displayed / scale;
+                if ui.small_button("−").on_hover_text("Zoom out 2×").clicked() {
+                    self.scope.timebase_ms_div =
+                        (self.scope.timebase_ms_div * 2.0).min(automatic.max_ms_div);
+                }
+                if ui.small_button("+").on_hover_text("Zoom in 2×").clicked() {
+                    self.scope.timebase_ms_div =
+                        (self.scope.timebase_ms_div / 2.0).max(automatic.min_ms_div);
+                }
+            } else {
+                let (scale, unit) = timebase_unit(automatic.ms_div);
+                ui.small(format!(
+                    "≈{:.3} {unit} · {}",
+                    automatic.ms_div * scale,
+                    if automatic.limited {
+                        "history limit (target: 2 cycles)"
+                    } else {
+                        "2 cycles"
+                    }
+                ));
+            }
+            ui.checkbox(&mut self.scope.auto_voltage, "Auto V");
+            if !self.scope.auto_voltage {
+                ui.add(
+                    egui::DragValue::new(&mut self.scope.voltage_v_div)
+                        .speed(0.1)
+                        .range(1e-6..=1e9)
+                        .suffix(" V/div"),
+                );
+            }
+            ui.checkbox(&mut self.scope.auto_current, "Auto A");
+            if !self.scope.auto_current {
+                ui.add(
+                    egui::DragValue::new(&mut self.scope.current_a_div)
+                        .speed(0.01)
+                        .range(1e-9..=1e9)
+                        .suffix(" A/div"),
+                );
+            }
+        });
+        let timebase = if self.scope.auto_timebase {
+            automatic
+        } else {
+            scope_timebase(sample_dt, frequency, gate_hz, self.scope.timebase_ms_div)
+        };
+        let window = timebase.window;
+        if self.trigger.window_samples != window {
+            self.trigger.window_samples = window;
+            self.trigger.reset();
+            self.trigger.last_time_s = Some(self.live.time_s);
+        }
+        let voltage_channels = [
+            (0, ScopeChannel::new("Source", BLUE, |r| r.source_v)),
+            (1, ScopeChannel::new("Port A–B", TEAL, |r| r.port_v)),
+            (2, ScopeChannel::new("Load P–N", ORANGE, |r| r.load_v)),
+        ];
+        let voltage =
+            live_channel_controls(ui, "VOLTAGE", &voltage_channels, &mut self.scope.voltage);
+        let powered = self.return_enabled;
+        let current_channels: Vec<_> = waveform_current_channels(powered)
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| (if powered || i < 2 { i } else { i + 2 }, c))
+            .collect();
+        let current =
+            live_channel_controls(ui, "CURRENT", &current_channels, &mut self.scope.current);
+        #[cfg(test)]
+        {
+            self.probe.live_channel_counts = Some((voltage.len(), current.len()));
+        }
+        if !self.scope.trigger_visible(self.trigger.source) {
+            ui.label(
+                RichText::new("TRIGGER SOURCE HIDDEN · still active")
+                    .color(ORANGE)
+                    .small(),
+            );
+        }
+        if self.live.error.is_none() && self.live.applied == self.live.desired {
+            self.trigger.update(&self.live.samples);
+        }
+        ui.label(
+            RichText::new(self.trigger.status())
+                .color(if self.trigger.capture.is_some() {
+                    TEAL
+                } else {
+                    MUTED
+                })
+                .monospace(),
+        );
+        if self.trigger.capture.is_none()
+            && self.live.samples.len() >= window
+            && let Some((min, max)) = self.trigger.observed_range(&self.live.samples)
+        {
+            let message = if self.trigger.level < min || self.trigger.level > max {
+                format!(
+                    "Trigger level outside observed {} range [{:.3}, {:.3}] {}; use Mid-level or adjust Level",
+                    self.trigger.source.name(),
+                    min,
+                    max,
+                    self.trigger.source.unit()
+                )
+            } else {
+                format!(
+                    "Waiting for a {} edge on {} at {:.3} {} and a full capture window",
+                    if self.trigger.edge == TriggerEdge::Rising {
+                        "rising"
+                    } else {
+                        "falling"
+                    },
+                    self.trigger.source.name(),
+                    self.trigger.level,
+                    self.trigger.source.unit()
+                )
+            };
+            ui.label(RichText::new(message).color(MUTED).small());
+        }
+        if let Some(error) = &self.live.error {
+            ui.label(RichText::new(format!("Live integration paused · {error}")).color(ORANGE));
+        }
+        ui.label(
+            RichText::new(format!(
+                "Simulated time {:.6} s · C1 {:.5} µF · {}{}",
+                self.live.time_s,
+                self.live_cap_uf,
+                if self.live.playing {
+                    "INTEGRATING"
+                } else {
+                    "PAUSED"
+                },
+                if self.live.pending && self.live.applied != self.live.desired {
+                    " · applying edit"
+                } else {
+                    ""
+                },
+            ))
+            .monospace()
+            .color(TEAL),
+        );
+        ui.small("Simulation time is not wall-clock time. Ideal component edits retain voltages/currents but can change stored energy. Not numerically grid-checked or hardware-validated.");
+        if self.live.error.is_some() || self.live.applied != self.live.desired {
+            return;
+        }
+        let (scope, trigger_time) = if let Some(capture) = &self.trigger.capture {
+            (capture.samples.as_slice(), Some(capture.time_s))
+        } else if self.trigger.mode == TriggerMode::Auto {
+            (
+                &self.live.samples[self.live.samples.len().saturating_sub(window)..],
+                None,
+            )
+        } else {
+            ui.small("Scope waiting for a complete triggered window; simulated time continues.");
+            return;
+        };
+        if scope.len() < 2 {
+            return;
+        }
+        let h = ((ui.available_height() - 20.0) * 0.5).clamp(145.0, 340.0);
+        if voltage.is_empty() {
+            ui.small("No voltage signals selected");
+        }
+        let plot = live_scope_plot(
+            ui,
+            ("live_voltage", self.live.generation),
+            h,
+            scope,
+            &voltage,
+            "V",
+            trigger_time,
+            (trigger_time.is_some() && self.trigger.source.unit() == "V")
+                .then_some(self.trigger.level),
+            (!self.scope.auto_voltage).then_some(self.scope.voltage_v_div),
+            Some(timebase.ms_div),
+        );
+        #[cfg(test)]
+        {
+            self.probe.live_voltage_bounds = Some((plot.bounds().min(), plot.bounds().max()));
+            self.probe.live_voltage_frame = Some(*plot.frame());
+        }
+        #[cfg(not(test))]
+        let _ = plot;
+        if current.is_empty() {
+            ui.small("No current signals selected");
+        }
+        let plot = live_scope_plot(
+            ui,
+            ("live_current", self.live.generation),
+            h,
+            scope,
+            &current,
+            "A",
+            trigger_time,
+            (trigger_time.is_some() && self.trigger.source.unit() == "A")
+                .then_some(self.trigger.level),
+            (!self.scope.auto_current).then_some(self.scope.current_a_div),
+            Some(timebase.ms_div),
+        );
+        let _ = plot;
+    }
+
     fn overview(&mut self, ui: &mut egui::Ui) {
         #[cfg(test)]
         {
@@ -1691,7 +2572,8 @@ impl LabApp {
             self.sweep_hover_generation = self.plot_generation;
             self.sweep_hover_transforms = [None; 4];
         }
-        let hovered_index = ui.ctx()
+        let hovered_index = ui
+            .ctx()
             .input(|input| input.pointer.hover_pos())
             .filter(|pos| ui.clip_rect().contains(*pos))
             .and_then(|pos| hovered_sweep_index(pos, &self.sweep_hover_transforms, &sweep.results));
@@ -1734,9 +2616,14 @@ impl LabApp {
             }
             if let Some(check) = &m.resolution_check {
                 egui::CollapsingHeader::new(
-                    RichText::new(check.trend.as_deref().unwrap_or("Resolution check incomplete"))
-                        .color(if m.quality_pass { TEAL } else { ORANGE })
-                        .strong(),
+                    RichText::new(
+                        check
+                            .trend
+                            .as_deref()
+                            .unwrap_or("Resolution check incomplete"),
+                    )
+                    .color(if m.quality_pass { TEAL } else { ORANGE })
+                    .strong(),
                 )
                 .id_salt(("resolution_details", self.plot_generation, self.selected))
                 .show(ui, |ui| {
@@ -1866,11 +2753,14 @@ impl LabApp {
                             plot,
                             hovered.map(|point| {
                                 let m = &point.metrics;
-                                (m, if observed.location == Location::Source {
-                                    m.source_power_w
-                                } else {
-                                    m.fundamental_active_power_w
-                                })
+                                (
+                                    m,
+                                    if observed.location == Location::Source {
+                                        m.source_power_w
+                                    } else {
+                                        m.fundamental_active_power_w
+                                    },
+                                )
                             }),
                             selected.map(|point| &point.metrics),
                         );
@@ -1936,7 +2826,8 @@ impl LabApp {
                     );
                     mark_hovered_point(
                         plot,
-                        hovered.map(|point| (&point.metrics, point.metrics.input_admittance_real_s)),
+                        hovered
+                            .map(|point| (&point.metrics, point.metrics.input_admittance_real_s)),
                         selected.map(|point| &point.metrics),
                     );
                 });
@@ -2010,150 +2901,166 @@ impl LabApp {
             .animated(false)
             .auto_shrink([false, false]);
         if focus_row == Some(0) {
-            table_scroll = table_scroll.vertical_scroll_offset(0.0).horizontal_scroll_offset(0.0);
+            table_scroll = table_scroll
+                .vertical_scroll_offset(0.0)
+                .horizontal_scroll_offset(0.0);
         }
         let table = table_scroll.show(ui, |ui| {
-                egui::Grid::new("sweep_table")
-                    .striped(true)
-                    .min_col_width(95.0)
-                    .show(ui, |ui| {
-                        for (column, title) in [
-                            "C each (µF)",
-                            "Load V rms",
-                            "Load W",
-                            "Input A rms",
-                            "Zin (Ω)",
-                            "|Γ|",
-                            "G total (mS)",
-                            "Balance %",
-                        ]
-                        .into_iter()
-                        .enumerate()
-                        {
-                            let header = ui.strong(title);
-                            #[cfg(test)]
-                            if column == 0 {
-                                self.probe.table_header = Some(header.rect);
-                            }
-                            #[cfg(not(test))]
-                            let _ = (column, header);
+            egui::Grid::new("sweep_table")
+                .striped(true)
+                .min_col_width(95.0)
+                .show(ui, |ui| {
+                    for (column, title) in [
+                        "C each (µF)",
+                        "Load V rms",
+                        "Load W",
+                        "Input A rms",
+                        "Zin (Ω)",
+                        "|Γ|",
+                        "G total (mS)",
+                        "Balance %",
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let header = ui.strong(title);
+                        #[cfg(test)]
+                        if column == 0 {
+                            self.probe.table_header = Some(header.rect);
                         }
-                        ui.end_row();
-                        for i in 0..rows {
-                            match &sweep.results[i] {
-                                Ok(r) => {
-                                    let m = &r.metrics;
-                                    let selected = self.selected == Some(i);
-                                    let hovered = hovered_index == Some(i);
-                                    let highlighted = selected || hovered;
-                                    let mut clicked = false;
-                                    let first_cell = ui.selectable_label(
+                        #[cfg(not(test))]
+                        let _ = (column, header);
+                    }
+                    ui.end_row();
+                    for i in 0..rows {
+                        match &sweep.results[i] {
+                            Ok(r) => {
+                                let m = &r.metrics;
+                                let selected = self.selected == Some(i);
+                                let hovered = hovered_index == Some(i);
+                                let highlighted = selected || hovered;
+                                let mut clicked = false;
+                                let first_cell = ui.selectable_label(
+                                    highlighted,
+                                    RichText::new(format!(
+                                        "{}{:0.5}",
+                                        if selected { "▶ " } else { "" },
+                                        m.capacitance_each_uf
+                                    ))
+                                    .color(if selected {
+                                        GOLD
+                                    } else if hovered {
+                                        TEAL
+                                    } else {
+                                        Color32::LIGHT_GRAY
+                                    })
+                                    .strong()
+                                    .monospace(),
+                                );
+                                clicked |= first_cell.clicked();
+                                if focus_row == Some(i) && i != 0 {
+                                    ui.scroll_to_rect(first_cell.rect, None);
+                                }
+                                #[cfg(test)]
+                                if selected {
+                                    self.probe.selected_table_cell = Some(first_cell.rect);
+                                }
+                                #[cfg(test)]
+                                if hovered {
+                                    self.probe.hovered_table_cell = Some(first_cell.rect);
+                                }
+                                clicked |= ui
+                                    .selectable_label(
+                                        highlighted,
+                                        RichText::new(format!("{:.4}", m.load_voltage_rms_v))
+                                            .monospace(),
+                                    )
+                                    .clicked();
+                                clicked |= ui
+                                    .selectable_label(
+                                        highlighted,
+                                        RichText::new(format!("{:.4}", m.load_power_w)).monospace(),
+                                    )
+                                    .clicked();
+                                clicked |= ui
+                                    .selectable_label(
+                                        highlighted,
+                                        RichText::new(format!("{:.4}", m.input_current_rms_a))
+                                            .monospace(),
+                                    )
+                                    .clicked();
+                                clicked |= ui
+                                    .selectable_label(
                                         highlighted,
                                         RichText::new(format!(
-                                            "{}{:0.5}",
-                                            if selected { "▶ " } else { "" },
-                                            m.capacitance_each_uf
+                                            "{:.3} {:+.3}j",
+                                            m.input_impedance_real_ohm, m.input_impedance_imag_ohm
                                         ))
-                                        .color(if selected { GOLD } else if hovered { TEAL } else { Color32::LIGHT_GRAY })
-                                        .strong(),
-                                    );
-                                    clicked |= first_cell.clicked();
-                                    if focus_row == Some(i) && i != 0 {
-                                        ui.scroll_to_rect(first_cell.rect, None);
-                                    }
-                                    #[cfg(test)]
-                                    if selected {
-                                        self.probe.selected_table_cell = Some(first_cell.rect);
-                                    }
-                                    #[cfg(test)]
-                                    if hovered {
-                                        self.probe.hovered_table_cell = Some(first_cell.rect);
-                                    }
-                                    clicked |= ui
-                                        .selectable_label(
-                                            highlighted,
-                                            format!("{:.4}", m.load_voltage_rms_v),
-                                        )
-                                        .clicked();
-                                    clicked |= ui
-                                        .selectable_label(
-                                            highlighted,
-                                            format!("{:.4}", m.load_power_w),
-                                        )
-                                        .clicked();
-                                    clicked |= ui
-                                        .selectable_label(
-                                            highlighted,
-                                            format!("{:.4}", m.input_current_rms_a),
-                                        )
-                                        .clicked();
-                                    clicked |= ui
-                                        .selectable_label(
-                                            highlighted,
-                                            format!(
-                                                "{:.3} {:+.3}j",
-                                                m.input_impedance_real_ohm,
-                                                m.input_impedance_imag_ohm
-                                            ),
-                                        )
-                                        .clicked();
-                                    clicked |= ui
-                                        .selectable_label(
-                                            highlighted,
+                                        .monospace(),
+                                    )
+                                    .clicked();
+                                clicked |= ui
+                                    .selectable_label(
+                                        highlighted,
+                                        RichText::new(
                                             m.reflection_magnitude
                                                 .map_or("—".into(), |g| format!("{g:.5}")),
                                         )
-                                        .clicked();
-                                    clicked |= ui
-                                        .selectable_label(
-                                            highlighted,
-                                            RichText::new(format!(
-                                                "{:+.4}",
-                                                1e3 * m.input_admittance_real_s
-                                            ))
-                                            .color(
-                                                if m.input_admittance_real_s < 0.0 {
-                                                    ORANGE
-                                                } else {
-                                                    TEAL
-                                                },
-                                            ),
-                                        )
-                                        .clicked();
-                                    clicked |= ui
-                                        .selectable_label(
-                                            highlighted,
-                                            RichText::new(format!(
-                                                "{:.3}{}",
-                                                m.energy_balance_percent,
-                                                if m.quality_pass { "" } else { "  CHECK" }
-                                            ))
-                                            .color(
-                                                if m.quality_pass {
-                                                    Color32::LIGHT_GRAY
-                                                } else {
-                                                    ORANGE
-                                                },
-                                            ),
-                                        )
-                                        .clicked();
-                                    if clicked {
-                                        self.selected = Some(i);
-                                    }
-                                }
-                                Err(error) => {
-                                    ui.label(RichText::new("FAILED").color(ORANGE));
-                                    ui.label("Solver issue · hover for details")
-                                        .on_hover_text(error);
-                                    for _ in 0..6 {
-                                        ui.label("—");
-                                    }
+                                        .monospace(),
+                                    )
+                                    .clicked();
+                                clicked |= ui
+                                    .selectable_label(
+                                        highlighted,
+                                        RichText::new(format!(
+                                            "{:+.4}",
+                                            1e3 * m.input_admittance_real_s
+                                        ))
+                                        .monospace()
+                                        .color(
+                                            if m.input_admittance_real_s < 0.0 {
+                                                ORANGE
+                                            } else {
+                                                TEAL
+                                            },
+                                        ),
+                                    )
+                                    .clicked();
+                                clicked |= ui
+                                    .selectable_label(
+                                        highlighted,
+                                        RichText::new(format!(
+                                            "{:.3}{}",
+                                            m.energy_balance_percent,
+                                            if m.quality_pass { "" } else { "  CHECK" }
+                                        ))
+                                        .monospace()
+                                        .color(
+                                            if m.quality_pass {
+                                                Color32::LIGHT_GRAY
+                                            } else {
+                                                ORANGE
+                                            },
+                                        ),
+                                    )
+                                    .clicked();
+                                if clicked {
+                                    self.selected = Some(i);
                                 }
                             }
-                            ui.end_row();
+                            Err(error) => {
+                                ui.label(RichText::new("FAILED").color(ORANGE));
+                                ui.label("Solver issue · hover for details")
+                                    .on_hover_text(error);
+                                for _ in 0..6 {
+                                    ui.label("—");
+                                }
+                            }
                         }
-                    });
-            });
+                        ui.end_row();
+                    }
+                });
+        });
         if let Some(i) = focus_row {
             self.table_focused = Some((self.plot_generation, i));
         }
@@ -2975,7 +3882,9 @@ fn hovered_sweep_index(
         .iter()
         .flatten()
         .find(|transform| transform.frame().contains(pointer))
-        .and_then(|transform| nearest_solved_index(results, transform.value_from_position(pointer).x))
+        .and_then(|transform| {
+            nearest_solved_index(results, transform.value_from_position(pointer).x)
+        })
 }
 
 fn sweep_hover(pos: &HoverPosition<'_>, rows: &[&ResultPoint]) -> Option<String> {
@@ -3036,6 +3945,7 @@ fn trace_hover(
     Some(result)
 }
 
+#[derive(Clone, Copy)]
 struct ScopeChannel {
     name: &'static str,
     color: Color32,
@@ -3052,18 +3962,63 @@ impl ScopeChannel {
     }
 }
 
+fn live_channel_controls(
+    ui: &mut egui::Ui,
+    name: &'static str,
+    channels: &[(usize, ScopeChannel)],
+    visible: &mut [bool],
+) -> Vec<ScopeChannel> {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(name).color(MUTED).size(11.0));
+        for &(index, channel) in channels {
+            ui.toggle_value(
+                &mut visible[index],
+                RichText::new(channel.name).color(channel.color),
+            )
+            .on_hover_text("Toggle this trace; triggering remains independent of visibility");
+        }
+        if ui.small_button("All").clicked() {
+            visible.fill(true);
+        }
+        if ui.small_button("None").clicked() {
+            visible.fill(false);
+        }
+        egui::ComboBox::from_id_salt(("live_solo", name))
+            .selected_text("Solo…")
+            .show_ui(ui, |ui| {
+                for &(index, channel) in channels {
+                    if ui.selectable_label(false, channel.name).clicked() {
+                        for flag in visible.iter_mut() {
+                            *flag = false;
+                        }
+                        visible[index] = true;
+                    }
+                }
+            });
+    });
+    channels
+        .iter()
+        .filter(|(index, _)| visible[*index])
+        .map(|(_, channel)| *channel)
+        .collect()
+}
+
 fn waveform_current_channels(powered_return: bool) -> Vec<ScopeChannel> {
     let mut channels = vec![
         ScopeChannel::new("Input", BLUE, |r| r.input_a),
         ScopeChannel::new("Load", TEAL, |r| r.load_a),
     ];
     if powered_return {
-        channels.push(ScopeChannel::new("Passive plug", Color32::LIGHT_GREEN, |r| {
-            r.plug_input_a
-        }));
-        channels.push(ScopeChannel::new("Powered return", Color32::LIGHT_YELLOW, |r| {
-            r.return_injection_a
-        }));
+        channels.push(ScopeChannel::new(
+            "Passive plug",
+            Color32::LIGHT_GREEN,
+            |r| r.plug_input_a,
+        ));
+        channels.push(ScopeChannel::new(
+            "Powered return",
+            Color32::LIGHT_YELLOW,
+            |r| r.return_injection_a,
+        ));
     }
     channels.extend([
         ScopeChannel::new("Diode D1", ORANGE, |r| r.diode_1_a),
@@ -3184,7 +4139,9 @@ fn scope_plot(
             nearest_trace_index(waveform, response.transform.value_from_position(pos).x)
         });
     if let Some(sample) = index.and_then(|i| waveform.get(i)) {
-        let mut tooltip = egui::Tooltip::for_enabled(&response.response).at_pointer().gap(12.0);
+        let mut tooltip = egui::Tooltip::for_enabled(&response.response)
+            .at_pointer()
+            .gap(12.0);
         tooltip.popup = tooltip.popup.frame(scope_tooltip_frame());
         tooltip.show(|ui| {
             ui.set_min_width(250.0);
@@ -3226,6 +4183,100 @@ fn scope_plot(
     (response.transform, index)
 }
 
+fn live_scope_plot(
+    ui: &mut egui::Ui,
+    id: (&'static str, u64),
+    height: f32,
+    waveform: &[diode_plug_lab::solver::Trace],
+    channels: &[ScopeChannel],
+    unit: &str,
+    trigger_time: Option<f64>,
+    trigger_level: Option<f64>,
+    vertical_div: Option<f64>,
+    timebase_ms_div: Option<f64>,
+) -> egui_plot::PlotTransform {
+    let mut plot = Plot::new(id)
+        .height(height)
+        .legend(Legend::default())
+        .auto_bounds([true, true])
+        .allow_zoom(false)
+        .allow_drag(false)
+        .reset(); // Follow the advancing window; do not retain bounds from earlier frames.
+    if let Some(div) = vertical_div.filter(|v| v.is_finite() && *v > 0.0) {
+        plot = plot.default_y_bounds(-4.0 * div, 4.0 * div);
+    }
+    if let Some(span) = timebase_ms_div
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v * 10.0)
+    {
+        let (left, right) = if trigger_time.is_some() {
+            (-0.25 * span, 0.75 * span)
+        } else {
+            let end = waveform.last().map_or(0.0, |s| s.time_s * 1e3);
+            (end - span, end)
+        };
+        plot = plot.default_x_bounds(left, right);
+    }
+    plot.label_formatter(|pos| {
+        let x = match pos {
+            HoverPosition::NearDataPoint { position, .. }
+            | HoverPosition::Elsewhere { position } => position.x,
+        };
+        nearest_trace_index(waveform, x + trigger_time.unwrap_or(0.0) * 1e3)
+            .and_then(|i| waveform.get(i))
+            .map(|sample| {
+                format!(
+                    "t {:.5} ms{}\n{}",
+                    sample.time_s * 1e3,
+                    trigger_time.map_or(String::new(), |t| format!(
+                        " · Δ {:+.5} ms",
+                        (sample.time_s - t) * 1e3
+                    )),
+                    channels
+                        .iter()
+                        .map(|c| format!("{}: {}", c.name, scope_value((c.value)(sample), unit)))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })
+    })
+    .show(ui, |plot| {
+        if trigger_time.is_some() {
+            plot.vline(
+                VLine::new("Trigger t=0", 0.0)
+                    .color(GOLD)
+                    .style(LineStyle::dashed_dense()),
+            );
+        }
+        if let Some(level) = trigger_level {
+            plot.hline(
+                egui_plot::HLine::new("Trigger level", level)
+                    .color(GOLD)
+                    .style(LineStyle::dashed_dense()),
+            );
+        }
+        for channel in channels {
+            plot.line(
+                Line::new(
+                    format!("{} ({unit})", channel.name),
+                    waveform
+                        .iter()
+                        .map(|sample| {
+                            [
+                                (sample.time_s - trigger_time.unwrap_or(0.0)) * 1e3,
+                                (channel.value)(sample),
+                            ]
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .color(channel.color)
+                .width(1.8),
+            );
+        }
+    })
+    .transform
+}
+
 fn nearest_trace_index(waveform: &[diode_plug_lab::solver::Trace], x_ms: f64) -> Option<usize> {
     if !x_ms.is_finite() || waveform.is_empty() {
         return None;
@@ -3257,7 +4308,9 @@ impl LabApp {
         {
             self.probe.header_bar = Some(ui.max_rect());
         }
-        let run_state = if self.running {
+        let run_state = if self.tab == 7 {
+            "LIVE TIME-DOMAIN · not lab-validated".into()
+        } else if self.running {
             format!("RUNNING  ·  {} / {}", self.progress.0, self.progress.1)
         } else if let Some(sweep) = &self.sweep {
             let solved = sweep.results.iter().filter(|r| r.is_ok()).count();
@@ -3280,17 +4333,23 @@ impl LabApp {
             "READY".into()
         };
         ui.horizontal(|ui| {
-            ui.label(RichText::new("DIODE-PLUG").size(18.0).strong().color(TEAL));
+            ui.label(
+                RichText::new("DIODE-PLUG")
+                    .size(16.0)
+                    .strong()
+                    .color(Color32::from_rgb(240, 243, 248)),
+            );
             ui.label(
                 RichText::new("/  CIRCUIT LABORATORY")
                     .size(12.0)
-                    .color(Color32::LIGHT_GRAY),
+                    .color(MUTED),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let state = egui::Frame::new()
-                    .fill(Color32::from_rgb(34, 53, 59))
-                    .corner_radius(5)
-                    .inner_margin(egui::Margin::symmetric(10, 4))
+                    .fill(Color32::from_rgb(21, 31, 39))
+                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .corner_radius(2)
+                    .inner_margin(egui::Margin::symmetric(10, 3))
                     .show(ui, |ui| {
                         ui.label(
                             RichText::new(&run_state)
@@ -3327,7 +4386,15 @@ impl LabApp {
             });
         });
         ui.add_space(3.0);
-        let (source, range) = if self.running || self.sweep.is_some() {
+        let (source, range) = if self.tab == 7 {
+            (
+                self.read_live_circuit()
+                    .map_or("Edit circuit inputs at left".into(), |c| {
+                        format!("{:.3} V RMS   ·   {:.3} Hz", c.voltage_rms, c.frequency)
+                    }),
+                format!("C1 {:.5} µF   ·   updates while editing", self.live_cap_uf),
+            )
+        } else if self.running || self.sweep.is_some() {
             let config = self.sweep.as_ref().map_or(&self.config, |s| &s.config);
             (
                 format!(
@@ -3345,64 +4412,91 @@ impl LabApp {
                 "Run a sweep to analyze C1".into(),
             )
         };
-        let selected = self.selected_result().map_or_else(
-            || {
-                if self.running {
-                    "Calculating…".into()
-                } else {
-                    "Select a solved point".into()
-                }
-            },
-            |point| {
-                let m = &point.metrics;
-                format!(
-                    "C1 {:.5} µF   ·   {:.3} V   ·   {:.3} W{}",
-                    m.capacitance_each_uf,
-                    m.load_voltage_rms_v,
-                    m.load_power_w,
-                    if m.quality_pass { "" } else { " · CHECK" }
-                )
-            },
-        );
+        let selected = if self.tab == 7 {
+            self.live
+                .samples
+                .last()
+                .map_or("Starting from zero…".into(), |sample| {
+                    format!(
+                        "t {:.5} ms   ·   load {:+.3} V   ·   input {:+.3} A",
+                        sample.time_s * 1e3,
+                        sample.load_v,
+                        sample.input_a
+                    )
+                })
+        } else {
+            self.selected_result().map_or_else(
+                || {
+                    if self.running {
+                        "Calculating…".into()
+                    } else {
+                        "Select a solved point".into()
+                    }
+                },
+                |point| {
+                    let m = &point.metrics;
+                    format!(
+                        "C1 {:.5} µF   ·   {:.3} V   ·   {:.3} W{}",
+                        m.capacitance_each_uf,
+                        m.load_voltage_rms_v,
+                        m.load_power_w,
+                        if m.quality_pass { "" } else { " · CHECK" }
+                    )
+                },
+            )
+        };
         let cards = [
             ("ANALYZED SOURCE", source),
-            ("CAPACITANCE SWEEP", range),
-            ("SELECTED LOAD", selected),
+            (
+                if self.tab == 7 {
+                    "LIVE CAPACITANCE"
+                } else {
+                    "CAPACITANCE SWEEP"
+                },
+                range,
+            ),
+            (
+                if self.tab == 7 {
+                    "LIVE STATE"
+                } else {
+                    "SELECTED LOAD"
+                },
+                selected,
+            ),
         ];
         ui.horizontal(|ui| {
             let width =
-                ((ui.available_width() - 2.0 * ui.spacing().item_spacing.x - 3.0) / 3.0).max(40.0);
+                ((ui.available_width() - 2.0 * ui.spacing().item_spacing.x - 12.0) / 3.0).max(40.0);
             for (index, (label, value)) in cards.iter().enumerate() {
                 let card = ui.allocate_ui_with_layout(
-                    egui::vec2(width, 42.0),
+                    egui::vec2(width, 39.0),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         egui::Frame::new()
                             .fill(if index == 2 {
-                                Color32::from_rgb(39, 52, 55)
+                                Color32::from_rgb(20, 29, 37)
                             } else {
-                                Color32::from_rgb(32, 42, 52)
+                                PANEL
                             })
-                            .corner_radius(5)
-                            .inner_margin(egui::Margin::symmetric(9, 4))
+                            .stroke(egui::Stroke::new(1.0, BORDER))
+                            .corner_radius(2)
+                            .inner_margin(egui::Margin::symmetric(9, 2))
                             .show(ui, |ui| {
                                 ui.set_min_width(width - 18.0);
-                                ui.label(
-                                    RichText::new(*label)
-                                        .size(10.0)
-                                        .color(Color32::from_gray(155)),
-                                );
+                                ui.label(RichText::new(*label).size(10.0).color(MUTED));
                                 let response = ui
                                     .add_sized(
                                         [width - 18.0, 18.0],
                                         egui::Label::new(
-                                            RichText::new(value).size(13.0).strong().color(
-                                                if index == 2 {
+                                            RichText::new(value)
+                                                .size(12.0)
+                                                .monospace()
+                                                .strong()
+                                                .color(if index == 2 {
                                                     GOLD
                                                 } else {
-                                                    Color32::from_gray(230)
-                                                },
-                                            ),
+                                                    Color32::from_rgb(216, 222, 233)
+                                                }),
                                         )
                                         .truncate(),
                                     )
@@ -3516,7 +4610,8 @@ impl LabApp {
             .exact_size(98.0)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(20, 27, 33))
+                    .fill(PANEL)
+                    .stroke(egui::Stroke::new(1.0, BORDER))
                     .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ui, |ui| self.header(ui));
@@ -3524,7 +4619,8 @@ impl LabApp {
             .exact_size(38.0)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(18, 25, 31))
+                    .fill(PANEL)
+                    .stroke(egui::Stroke::new(1.0, BORDER))
                     .inner_margin(egui::Margin::symmetric(12, 4)),
             )
             .show(ui, |ui| self.status_bar(ui));
@@ -3534,14 +4630,32 @@ impl LabApp {
                 .exact_size(370.0)
                 .frame(
                     egui::Frame::new()
-                        .fill(Color32::from_rgb(18, 27, 33))
+                        .fill(PANEL)
+                        .stroke(egui::Stroke::new(1.0, BORDER))
                         .inner_margin(egui::Margin::symmetric(12, 8)),
                 )
                 .show(ui, |ui| self.input_panel(ui));
             }
+            // Keep Live integration and trigger acquisition running while the
+            // operator inspects other views; Live is not a saved sweep.
+            let previous_circuit = self.live.applied.clone();
+            self.update_live(ui.ctx());
+            if previous_circuit.is_some() && self.live.applied != previous_circuit {
+                self.trigger.reset();
+                // Existing history describes the old circuit. Do not capture
+                // any of it under the new preset, including in Single mode.
+                self.trigger.last_time_s = Some(self.live.samples.last().map_or(
+                    self.live.time_s,
+                    |sample| sample.time_s.max(self.live.time_s),
+                ));
+            }
+            if self.tab != 7 && self.live.error.is_none() && self.live.applied == self.live.desired {
+                self.trigger.update(&self.live.samples);
+            }
             egui::CentralPanel::default().show(ui, |ui| {
                 // The tab bar stays fixed while the analysis scrolls independently.
                 ui.horizontal_wrapped(|ui| {
+                    self.tab_button(ui, 7, "Live");
                     self.tab_button(ui, 0, "Sweep");
                     self.tab_button(ui, 1, "Waveforms");
                     self.tab_button(ui, 2, "Energy");
@@ -3549,7 +4663,7 @@ impl LabApp {
                     self.tab_button(ui, 4, "Branches");
                     self.tab_button(ui, 5, "Measure");
                     self.tab_button(ui, 6, "Docs");
-                    if self.tab != 6 {
+                    if self.tab != 6 && self.tab != 7 {
                         ui.separator();
                         self.point_selector(ui);
                     }
@@ -3559,7 +4673,7 @@ impl LabApp {
                     self.probe.tab_bar = Some(ui.min_rect());
                 }
                 ui.separator();
-                if let Some(sweep) = &self.sweep {
+                if let Some(sweep) = &self.sweep && self.tab != 7 {
                     let failed = sweep.results.iter().filter(|r| r.is_err()).count();
                     let checks = sweep.results.iter().filter(|r| r.as_ref().is_ok_and(|p| !p.metrics.quality_pass)).count();
                     if checks > 0 || failed > 0 {
@@ -3584,6 +4698,7 @@ impl LabApp {
                     ))
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.tab {
+                        7 => self.live_view(ui),
                         0 => self.overview(ui),
                         1 => self.waveform(ui),
                         2 => self.diagnostics(ui),
@@ -3641,7 +4756,9 @@ mod ui_tests {
     impl Harness {
         fn new() -> Self {
             let ctx = egui::Context::default();
-            let app = LabApp::new_with_ctx(&ctx);
+            // Existing layout tests exercise Sweep; the shipped default is Live.
+            let mut app = LabApp::new_with_ctx(&ctx);
+            app.tab = 0;
             Self {
                 ctx,
                 app,
@@ -3672,7 +4789,11 @@ mod ui_tests {
         }
 
         fn scroll_analysis_to_table(&mut self, size: [f32; 2]) {
-            let scroll = self.app.probe.analysis_viewport.expect("analysis scroll area");
+            let scroll = self
+                .app
+                .probe
+                .analysis_viewport
+                .expect("analysis scroll area");
             self.wheel_at(size, egui::pos2(scroll.left() + 3.0, scroll.top() + 3.0));
             self.pass(size, None);
         }
@@ -3728,6 +4849,584 @@ mod ui_tests {
                 |ui| self.app.render(ui),
             );
             output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn live_run_integrates_forward_and_applies_edit_without_resetting_time_or_saving() {
+        let size = [1000.0, 680.0];
+        let mut h = Harness::new();
+        assert_eq!(LabApp::new_with_ctx(&h.ctx).tab, 7);
+        h.app.tab = 7;
+        h.app.live.playing = false;
+        h.pass(size, None);
+        assert_eq!(h.app.live.engine.as_ref().unwrap().time_s(), 0.0);
+        h.app.live.playing = true;
+        h.app.live.last_dispatch -= Duration::from_millis(100);
+        h.pass(size, None);
+        assert!(h.app.live.pending);
+        let result = h
+            .app
+            .live
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        h.app.form[0] = "48V".into();
+        h.app.live.playing = false;
+        h.app.live.sender.send(result).unwrap();
+        h.pass(size, None);
+        let time = h.app.live.time_s;
+        assert!(time > 0.0);
+        assert_eq!(
+            h.app.live.engine.as_ref().unwrap().circuit().voltage_rms,
+            48.0
+        );
+        assert_eq!(h.app.live.engine.as_ref().unwrap().time_s(), time);
+        assert!(h.app.output.is_none() && h.app.sweep.is_none());
+        h.app.live_cap_uf = 2.0;
+        h.pass(size, None);
+        assert_eq!(h.app.live.engine.as_ref().unwrap().capacitance_uf(), 2.0);
+        assert_eq!(h.app.live.time_s, time);
+        h.app.form[8] = "editing range".into();
+        h.app.form[10] = "editing points".into();
+        h.app.reference = "editing Z0".into();
+        h.pass(size, None);
+        assert!(
+            h.app.live.error.is_none(),
+            "sweep-only inputs must not halt live integration"
+        );
+        h.app.live.playing = true;
+        h.app.live.last_dispatch -= Duration::from_millis(100);
+        h.pass(size, None);
+        let result = h
+            .app
+            .live
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        h.app.live.playing = false;
+        h.app.live.sender.send(result).unwrap();
+        h.pass(size, None);
+        assert!(h.app.live.time_s > time);
+        h.app.form[0].clear();
+        h.pass(size, None);
+        assert!(h.app.live.error.is_some());
+        h.app.live.restart();
+        assert_eq!(h.app.live.time_s, 0.0);
+        h.app.tab = 6;
+        h.app.probe = Probe::default();
+        h.pass(size, None);
+        assert!(h.app.probe.input_scroll.is_none());
+    }
+
+    #[test]
+    fn oscilloscope_trigger_aligns_both_edges_and_honors_auto_normal_single() {
+        let template = diode_plug_lab::solver::simulate(&Circuit::default(), 1.0, None)
+            .unwrap()
+            .waveform[0]
+            .clone();
+        let samples: Vec<_> = (0..1024)
+            .map(|i| {
+                let mut sample = template.clone();
+                sample.time_s = i as f64 * 1e-4;
+                let phase = i % 80;
+                sample.source_v = if phase < 40 {
+                    phase as f64 - 20.0
+                } else {
+                    60.0 - phase as f64
+                };
+                sample.input_a = sample.source_v / 10.0;
+                sample
+            })
+            .collect();
+        let mut trigger = LiveTrigger::new();
+        trigger.mode = TriggerMode::Normal;
+        trigger.level = 0.5;
+        trigger.update(&samples[..511]);
+        assert!(trigger.capture.is_none());
+        assert!(trigger.status().contains("WAITING"));
+        trigger.update(&samples);
+        let capture = trigger.capture.as_ref().unwrap();
+        let mut scope_settings = LiveScopeSettings::new();
+        scope_settings.voltage[0] = false;
+        assert!(!scope_settings.trigger_visible(trigger.source));
+        assert!(
+            trigger.capture.is_some(),
+            "hiding a trace must not disable its trigger"
+        );
+        assert_eq!(capture.samples.len(), TRIGGER_WINDOW);
+        let crossing = capture.samples[TRIGGER_WINDOW / 4].time_s;
+        assert!(capture.samples[TRIGGER_WINDOW / 4 - 1].time_s < capture.time_s);
+        assert!(
+            crossing > capture.time_s,
+            "crossing should be interpolated between samples"
+        );
+        assert!(trigger.status().contains("holding"));
+        trigger.update(&samples);
+        assert_eq!(
+            trigger.count, 1,
+            "same crossing must not retrigger every frame"
+        );
+        trigger.source = TriggerSource::InputA;
+        trigger.edge = TriggerEdge::Falling;
+        trigger.level = 0.05;
+        trigger.reset();
+        trigger.update(&samples);
+        let capture = trigger.capture.as_ref().unwrap();
+        assert!(capture.samples[TRIGGER_WINDOW / 4 - 1].input_a > 0.05);
+        assert!(capture.samples[TRIGGER_WINDOW / 4].input_a <= 0.05);
+        trigger.mode = TriggerMode::Single;
+        trigger.reset();
+        trigger.update(&samples);
+        assert!(!trigger.armed && trigger.count == 1);
+        trigger.update(&samples);
+        assert_eq!(trigger.count, 1);
+        trigger.reset();
+        trigger.mode = TriggerMode::Auto;
+        trigger.level = 1e6;
+        trigger.update(&samples);
+        assert!(trigger.capture.is_none() && trigger.status().contains("free-running"));
+        trigger.level = 0.05;
+        trigger.update(&samples);
+        assert!(trigger.capture.is_some());
+        let mut stopped = samples;
+        stopped.extend((1024..2400).map(|i| {
+            let mut sample = template.clone();
+            sample.time_s = i as f64 * 1e-4;
+            sample.input_a = -10.0;
+            sample
+        }));
+        trigger.update(&stopped);
+        assert!(
+            trigger.capture.is_none(),
+            "Auto must free-run again if no new crossing arrives"
+        );
+    }
+
+    #[test]
+    fn trigger_holdoff_rejects_repeated_edges_then_accepts_a_later_one() {
+        let template = diode_plug_lab::solver::simulate(&Circuit::default(), 1.0, None)
+            .unwrap()
+            .waveform[0]
+            .clone();
+        let samples: Vec<_> = (0..1400)
+            .map(|i| {
+                let mut sample = template.clone();
+                sample.time_s = i as f64 * 1e-4;
+                sample.source_v = (i % 80) as f64 - 40.0;
+                sample
+            })
+            .collect();
+        let mut trigger = LiveTrigger::new();
+        trigger.mode = TriggerMode::Normal;
+        trigger.holdoff_ms = 30.0;
+        trigger.window_samples = 256;
+        trigger.update(&samples[..700]);
+        assert_eq!(trigger.capture.as_ref().unwrap().samples.len(), 256);
+        assert_eq!(trigger.count, 1);
+        trigger.update(&samples[..760]);
+        assert_eq!(trigger.count, 1);
+        trigger.update(&samples);
+        assert!(trigger.count > 1);
+    }
+
+    #[test]
+    fn battery_charging_preset_live_scope_triggers_on_source_voltage() {
+        let preset = diode_plug_lab::presets::all()
+            .into_iter()
+            .find(|p| p.name == "24 V battery charging proxy")
+            .unwrap();
+        let mut transient =
+            diode_plug_lab::solver::Transient::new(preset.config.circuit, 1.0).unwrap();
+        let mut trigger = LiveTrigger::new();
+        for _ in 0..75 {
+            transient.advance(128).unwrap();
+            trigger.update(&transient.waveform());
+            if trigger.capture.is_some() {
+                break;
+            }
+        }
+        assert!(
+            trigger.capture.is_some(),
+            "source 0 V rising edge should trigger; simulated time {:.4} s",
+            transient.time_s()
+        );
+        let mut load_v = LiveTrigger::new();
+        load_v.source = TriggerSource::LoadV;
+        load_v.window_samples = MAX_TRIGGER_WINDOW;
+        let mut load_a = LiveTrigger::new();
+        load_a.source = TriggerSource::LoadA;
+        load_a.window_samples = MAX_TRIGGER_WINDOW;
+        for _ in 0..180 {
+            transient.advance(128).unwrap();
+            let samples = transient.waveform();
+            if load_v.level == 0.0 && samples.len() > 4096 {
+                assert!(load_v.set_mid_level(&samples));
+                assert!(
+                    load_v.level > 0.0,
+                    "battery load voltage requires a positive level"
+                );
+            }
+            load_v.update(&samples);
+            load_a.update(&samples);
+            if load_v.capture.is_some() && load_a.capture.is_some() {
+                break;
+            }
+        }
+        assert!(
+            load_v.capture.is_some(),
+            "load voltage must trigger with an observed mid-level at the widest timebase"
+        );
+        assert!(
+            load_a.capture.is_some(),
+            "0 → positive charging current must trigger at 0 A at the widest timebase"
+        );
+    }
+
+    #[test]
+    fn every_preset_can_trigger_live_at_default_and_widest_timebase() {
+        for preset in diode_plug_lab::presets::all() {
+            let c = &preset.config;
+            let cap = (c.capacitance_min_uf * c.capacitance_max_uf).sqrt();
+            let mut transient = diode_plug_lab::solver::Transient::new(c.circuit.clone(), cap)
+                .unwrap_or_else(|e| panic!("{}: {e}", preset.name));
+            let mut normal = LiveTrigger::new();
+            normal.mode = TriggerMode::Normal;
+            let mut automatic = LiveTrigger::new();
+            automatic.mode = TriggerMode::Normal;
+            let mut wide = LiveTrigger::new();
+            wide.mode = TriggerMode::Single;
+            wide.window_samples = MAX_TRIGGER_WINDOW;
+            // Allow two full source cycles plus room for a complete wide
+            // capture even when its span exceeds several source periods.
+            transient
+                .advance(128)
+                .unwrap_or_else(|e| panic!("{}: {e}", preset.name));
+            let dt = transient.waveform()[1].time_s - transient.waveform()[0].time_s;
+            let auto_scale = scope_timebase(
+                dt,
+                c.circuit.frequency,
+                c.circuit.pulse_gate.as_ref().map(|gate| gate.repetition_hz),
+                0.0,
+            );
+            automatic.window_samples = auto_scale.window;
+            let until = 2.0 / c.circuit.frequency + 2.0 * MAX_TRIGGER_WINDOW as f64 * dt;
+            while transient.time_s() < until {
+                transient
+                    .advance(128)
+                    .unwrap_or_else(|e| panic!("{}: {e}", preset.name));
+                let samples = transient.waveform();
+                normal.update(&samples);
+                automatic.update(&samples);
+                wide.update(&samples);
+                if normal.capture.is_some() && automatic.capture.is_some() && wide.capture.is_some()
+                {
+                    break;
+                }
+            }
+            assert!(
+                normal.capture.is_some(),
+                "{}: default Live trigger did not capture",
+                preset.name
+            );
+            assert!(
+                automatic.capture.is_some(),
+                "{}: Auto timebase did not find a valid trigger",
+                preset.name
+            );
+            if !auto_scale.limited {
+                assert!(
+                    (auto_scale.ms_div * 10.0 * c.circuit.frequency / 1e3 - 2.0).abs() < 0.02,
+                    "{}: Auto timebase must show about two cycles",
+                    preset.name
+                );
+            }
+            assert!(
+                wide.capture.is_some(),
+                "{}: widest timebase did not capture at {:.5} s, {} samples, dt {:.3e} s",
+                preset.name,
+                transient.time_s(),
+                transient.waveform().len(),
+                transient
+                    .waveform()
+                    .windows(2)
+                    .last()
+                    .map_or(0.0, |p| p[1].time_s - p[0].time_s)
+            );
+            assert_eq!(
+                wide.capture.as_ref().unwrap().samples.len(),
+                MAX_TRIGGER_WINDOW
+            );
+            let samples = transient.waveform();
+            for source in [
+                TriggerSource::SourceV,
+                TriggerSource::PortV,
+                TriggerSource::LoadV,
+                TriggerSource::InputA,
+                TriggerSource::LoadA,
+            ] {
+                for edge in [TriggerEdge::Rising, TriggerEdge::Falling] {
+                    let mut trigger = LiveTrigger::new();
+                    trigger.source = source;
+                    trigger.edge = edge;
+                    trigger.mode = TriggerMode::Normal;
+                    if !trigger.set_mid_level(&samples) {
+                        continue;
+                    } // A flat channel has no edge.
+                    let pre = TRIGGER_WINDOW / 4;
+                    let last = samples.len() - (TRIGGER_WINDOW - pre);
+                    let eligible = (pre..=last).any(|i| {
+                        let a = source.value(&samples[i - 1]);
+                        let b = source.value(&samples[i]);
+                        match edge {
+                            TriggerEdge::Rising => a <= trigger.level && b > trigger.level,
+                            TriggerEdge::Falling => a > trigger.level && b <= trigger.level,
+                        }
+                    });
+                    trigger.update(&samples);
+                    assert_eq!(
+                        trigger.capture.is_some(),
+                        eligible,
+                        "{}: {} {:?} trigger should capture exactly when the selected level has an eligible edge",
+                        preset.name,
+                        source.name(),
+                        edge
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auto_timebase_tracks_frequency_and_reports_when_history_is_too_short() {
+        assert_eq!(timebase_unit(0.0002), (1e6, "ns/div"));
+        assert_eq!(timebase_unit(0.2), (1e3, "µs/div"));
+        assert_eq!(timebase_unit(4.0), (1.0, "ms/div"));
+        assert_eq!(timebase_unit(2_000.0), (1e-3, "s/div"));
+        for hz in [50.0, 60.0, 1_000.0, 100_000.0] {
+            let dt = 1.0 / (hz * 2048.0);
+            let timebase = scope_timebase(dt, hz, None, 0.0);
+            assert!(!timebase.limited);
+            assert!((timebase.ms_div * 10.0 * hz / 1e3 - 2.0).abs() < 0.001);
+            assert_eq!(timebase.window, 4096);
+        }
+        let gated = scope_timebase(7.0 / (50.0 * 2048.0), 50.0, Some(5.0), 0.0);
+        assert!(!gated.limited);
+        assert!((gated.ms_div - 40.0).abs() < 0.1);
+        let limited = scope_timebase(1.0 / (50.0 * 2048.0), 50.0, None, 1e6);
+        assert!(limited.limited);
+        assert_eq!(limited.window, MAX_TRIGGER_WINDOW);
+        let edited = scope_timebase(1.0 / (1_000.0 * 2048.0), 1_000.0, None, 0.0);
+        assert!((gated.ms_div / edited.ms_div) > 30.0);
+        let mut circuit = diode_plug_lab::presets::all()[0].config.circuit.clone();
+        circuit.pulse_gate = Some(diode_plug_lab::solver::PulseGate {
+            repetition_hz: 5.0,
+            duty: 0.4,
+        });
+        let mut transient = diode_plug_lab::solver::Transient::new(circuit, 1.0).unwrap();
+        transient.advance(512).unwrap();
+        let history = transient.waveform();
+        let recorded_dt = history[1].time_s - history[0].time_s;
+        let gate_auto = scope_timebase(recorded_dt, 50.0, Some(5.0), 0.0);
+        assert!(
+            !gate_auto.limited,
+            "a slower pulse gate must fit in Auto after scope sampling"
+        );
+        assert!((gate_auto.ms_div - 40.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn live_trigger_and_settings_survive_other_views_and_preset_changes() {
+        let mut h = Harness::new();
+        let size = [1000.0, 680.0];
+        h.app.live.playing = false;
+        h.app.tab = 7;
+        h.pass(size, None);
+        h.app.scope.auto_timebase = false;
+        h.app.scope.timebase_ms_div = 2.0;
+        h.app.trigger.mode = TriggerMode::Single;
+        h.pass(size, None);
+        let window = h.app.trigger.window_samples;
+        h.app.tab = 0;
+        let template = h.app.live.samples[0].clone();
+        let dt = 0.02 / window as f64;
+        h.app.live.samples = (0..window + 512)
+            .map(|i| {
+                let mut sample = template.clone();
+                sample.time_s = i as f64 * dt;
+                sample.source_v = (i % 120) as f64 - 60.0;
+                sample
+            })
+            .collect();
+        h.pass(size, None);
+        assert!(
+            !h.app.trigger.armed,
+            "Single should capture while another view is open"
+        );
+        let captured = h.app.trigger.capture.as_ref().unwrap().time_s;
+        h.pass(size, None);
+        assert_eq!(h.app.trigger.capture.as_ref().unwrap().time_s, captured);
+        let preset = diode_plug_lab::presets::all()
+            .iter()
+            .position(|p| p.name == "24 V battery charging proxy")
+            .unwrap();
+        h.app.apply_preset(preset);
+        h.pass(size, None);
+        assert!(
+            h.app.live.applied == h.app.live.desired,
+            "Live should accept preset changes outside its view"
+        );
+        assert!(
+            h.app.trigger.capture.is_none(),
+            "a capture from the old circuit must not survive a preset change"
+        );
+        assert!(h.app.trigger.armed, "preset changes should re-arm Single");
+        h.app.tab = 7;
+        h.pass(size, None);
+        assert_eq!(h.app.trigger.mode, TriggerMode::Single);
+        assert!(!h.app.scope.auto_timebase);
+        assert!(
+            h.app.scope.timebase_ms_div > 0.0,
+            "horizontal scaling remains available after changing presets"
+        );
+    }
+
+    #[test]
+    fn every_preset_exposes_live_scope_controls_without_resetting_operator_choices() {
+        let mut h = Harness::new();
+        h.app.live.playing = false;
+        h.app.tab = 7;
+        h.app.scope.auto_timebase = false;
+        h.app.scope.auto_voltage = false;
+        h.app.scope.voltage_v_div = 4.0;
+        h.app.scope.voltage[0] = false;
+        h.app.trigger.source = TriggerSource::LoadA;
+        h.app.trigger.mode = TriggerMode::Auto;
+        for (index, preset) in diode_plug_lab::presets::all().iter().enumerate() {
+            h.app.apply_preset(index);
+            h.pass([1000.0, 680.0], None);
+            let engine = h.app.live.engine.as_mut().unwrap();
+            engine
+                .advance(128)
+                .unwrap_or_else(|e| panic!("{}: {e}", preset.name));
+            h.app.live.samples = engine.waveform();
+            h.app.live.time_s = engine.time_s();
+            h.pass([1000.0, 680.0], None);
+            assert!(
+                h.app.live.error.is_none(),
+                "{}: {:?}",
+                preset.name,
+                h.app.live.error
+            );
+            assert!(
+                h.app.live.engine.is_some(),
+                "{}: no Live engine",
+                preset.name
+            );
+            assert!(
+                h.app.probe.live_voltage_bounds.is_some(),
+                "{}: no scope",
+                preset.name
+            );
+            assert_eq!(
+                h.app.probe.live_channel_counts.unwrap().0,
+                2,
+                "{}",
+                preset.name
+            );
+            assert_eq!(
+                h.app.trigger.source,
+                TriggerSource::LoadA,
+                "{}",
+                preset.name
+            );
+            assert_eq!(h.app.trigger.mode, TriggerMode::Auto, "{}", preset.name);
+            assert!(!h.app.scope.auto_timebase, "{}", preset.name);
+            assert_eq!(h.app.scope.voltage_v_div, 4.0, "{}", preset.name);
+        }
+    }
+
+    #[test]
+    fn live_scope_signal_visibility_and_manual_scales_do_not_change_trigger_source() {
+        let size = [1000.0, 680.0];
+        let mut h = Harness::new();
+        h.app.tab = 7;
+        h.app.live.playing = false;
+        h.pass(size, None);
+        let template = diode_plug_lab::solver::simulate(&Circuit::default(), 1.0, None)
+            .unwrap()
+            .waveform[0]
+            .clone();
+        h.app.live.samples = (0..1024)
+            .map(|i| {
+                let mut sample = template.clone();
+                sample.time_s = i as f64 * 1e-4;
+                sample.source_v = 2.0;
+                sample
+            })
+            .collect();
+        h.app.trigger.level = 1e6; // AUTO free-run, never trigger.
+        h.app.scope.voltage[0] = false;
+        h.app.scope.current.fill(false);
+        h.app.scope.auto_timebase = false;
+        h.app.scope.timebase_ms_div = 1.0;
+        h.app.scope.auto_voltage = false;
+        h.app.scope.voltage_v_div = 5.0;
+        h.pass(size, None);
+        assert_eq!(h.app.probe.live_channel_counts, Some((2, 0)));
+        assert!(!h.app.scope.trigger_visible(TriggerSource::SourceV));
+        assert_eq!(h.app.trigger.source, TriggerSource::SourceV);
+        let (min, max) = h.app.probe.live_voltage_bounds.unwrap();
+        assert!(
+            (max[0] - min[0] - 10.0).abs() < 0.5,
+            "10 divisions at 1 ms/div: {min:?} {max:?}"
+        );
+        assert!(
+            (min[1] + 20.0).abs() < 1.0 && (max[1] - 20.0).abs() < 1.0,
+            "8 divisions at 5 V/div: {min:?} {max:?}"
+        );
+        assert!(h.app.live.engine.is_some());
+        assert!(
+            h.app
+                .probe
+                .analysis_viewport
+                .unwrap()
+                .intersect(h.app.probe.live_voltage_frame.unwrap())
+                .height()
+                >= 30.0,
+            "live scope must be visible beneath controls in a 1000×680 window"
+        );
+        h.app.scope.timebase_ms_div = 5.0;
+        h.pass(size, None);
+        let (min, max) = h.app.probe.live_voltage_bounds.unwrap();
+        assert!(
+            (max[0] - min[0] - 50.0).abs() < 0.5,
+            "horizontal slider must change the visible span: {min:?} {max:?}"
+        );
+        assert_eq!(h.app.trigger.window_samples, 500);
+        h.app.scope.auto_timebase = true;
+        h.pass(size, None);
+        let frequency = h.app.read_live_circuit().unwrap().frequency;
+        let automatic = scope_timebase(1e-4, frequency, None, 0.0);
+        let (min, max) = h.app.probe.live_voltage_bounds.unwrap();
+        assert_eq!(h.app.trigger.window_samples, automatic.window);
+        assert!(
+            (max[0] - min[0] - automatic.ms_div * 10.0).abs() < 0.5,
+            "Auto must change horizontal bounds to follow frequency: {min:?} {max:?}"
+        );
+    }
+
+    #[test]
+    fn live_workspace_fits_compact_windows_without_sweep_controls() {
+        for size in [[1000.0, 680.0], [760.0, 520.0]] {
+            let mut h = Harness::new();
+            h.app.tab = 7;
+            h.pass(size, None);
+            h.pass(size, None);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
+            assert!(screen.contains_rect(h.app.probe.run_button.unwrap()));
+            assert!(screen.contains_rect(h.app.probe.analysis_viewport.unwrap()));
+            assert!(h.app.probe.point_next.is_none());
         }
     }
 
@@ -3822,10 +5521,14 @@ mod ui_tests {
         let button = probe.run_button.expect("RUN button");
         let institute = probe.institute_link.expect("institute credit");
         let state = probe.header_state.expect("header state");
-        assert!(institute.right() < button.left() && button.right() < state.left(),
-            "{label}: expected institute, RUN, status in that order at {size:?}");
-        assert!((button.height() - state.height()).abs() <= 0.5,
-            "{label}: RUN and status heights differ at {size:?}: {button:?} vs {state:?}");
+        assert!(
+            institute.right() < button.left() && button.right() < state.left(),
+            "{label}: expected institute, RUN, status in that order at {size:?}"
+        );
+        assert!(
+            (button.height() - state.height()).abs() <= 0.5,
+            "{label}: RUN and status heights differ at {size:?}: {button:?} vs {state:?}"
+        );
         let scroll = probe.input_scroll.expect("input form");
         let bar = probe.status_bar.expect("application status bar");
         assert!(probe.header_bar.expect("header").contains_rect(button));
@@ -4129,14 +5832,22 @@ mod ui_tests {
         h.app.plot_generation += 1;
         h.pass(size, None);
         h.pass(size, None);
-        assert!(h.app.probe.analysis_viewport.unwrap().intersects(
-            *h.app.probe.sweep_plot_transforms[0].unwrap().frame()
-        ), "a new run should open with the plots in view");
+        assert!(
+            h.app
+                .probe
+                .analysis_viewport
+                .unwrap()
+                .intersects(*h.app.probe.sweep_plot_transforms[0].unwrap().frame()),
+            "a new run should open with the plots in view"
+        );
         h.scroll_analysis_to_table(size);
         let header = h.app.probe.table_header.unwrap();
-        assert!(h.app.probe.table_viewport.unwrap().contains_rect(header),
+        assert!(
+            h.app.probe.table_viewport.unwrap().contains_rect(header),
             "header={header:?}, table={:?}, analysis={:?}",
-            h.app.probe.table_viewport, h.app.probe.analysis_viewport);
+            h.app.probe.table_viewport,
+            h.app.probe.analysis_viewport
+        );
     }
 
     #[test]
@@ -4293,7 +6004,11 @@ mod ui_tests {
                     (transform.bounds().min()[1] + transform.bounds().max()[1]) * 0.5,
                 ));
                 h.pass(size, Some(pointer));
-                assert_eq!(h.app.probe.hovered_sweep, Some(2), "plot {plot}, observed={observed}");
+                assert_eq!(
+                    h.app.probe.hovered_sweep,
+                    Some(2),
+                    "plot {plot}, observed={observed}"
+                );
                 assert!(h.app.probe.hovered_table_cell.is_some());
                 assert_eq!(h.app.selected, Some(0), "hover must not change selection");
             }
@@ -4328,10 +6043,18 @@ mod ui_tests {
             h.pass(size, None);
             let first_plot = h.app.probe.sweep_plot_transforms[0].unwrap();
             let table = h.app.probe.table_viewport.unwrap();
-            assert!(first_plot.frame().top() < table.top(),
-                "sweep plots should appear before the table at {size:?}");
-            assert!(h.app.probe.analysis_viewport.unwrap().intersects(*first_plot.frame()),
-                "first sweep plot should be visible without scrolling at {size:?}");
+            assert!(
+                first_plot.frame().top() < table.top(),
+                "sweep plots should appear before the table at {size:?}"
+            );
+            assert!(
+                h.app
+                    .probe
+                    .analysis_viewport
+                    .unwrap()
+                    .intersects(*first_plot.frame()),
+                "first sweep plot should be visible without scrolling at {size:?}"
+            );
             h.scroll_analysis_to_table(size);
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
             for (name, rect) in [
@@ -4493,14 +6216,17 @@ mod ui_tests {
                         ..Default::default()
                     },
                     |ui| {
-                        transform = Some(scope_plot(
-                            ui,
-                            (name, 0, Some(0)),
-                            280.0,
-                            &point.waveform,
-                            channels,
-                            unit,
-                        ).0);
+                        transform = Some(
+                            scope_plot(
+                                ui,
+                                (name, 0, Some(0)),
+                                280.0,
+                                &point.waveform,
+                                channels,
+                                unit,
+                            )
+                            .0,
+                        );
                     },
                 );
                 output.textures_delta.clear();
@@ -4520,14 +6246,17 @@ mod ui_tests {
                     ..Default::default()
                 },
                 |ui| {
-                    hovered = Some(scope_plot(
-                        ui,
-                        (name, 0, Some(0)),
-                        280.0,
-                        &point.waveform,
-                        channels,
-                        unit,
-                    ).1);
+                    hovered = Some(
+                        scope_plot(
+                            ui,
+                            (name, 0, Some(0)),
+                            280.0,
+                            &point.waveform,
+                            channels,
+                            unit,
+                        )
+                        .1,
+                    );
                 },
             );
             output.textures_delta.clear();

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::f64::consts::{PI, SQRT_2};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -428,6 +429,7 @@ struct Context<'a> {
     mode: Drive,
     period: f64,
     steps: usize,
+    phase_offset: f64,
 }
 
 impl Context<'_> {
@@ -495,11 +497,10 @@ impl Context<'_> {
 
     fn evaluate_stiff(&self, t: f64, s: State) -> (State, Instant) {
         let c = self.circuit;
-        let vs = SQRT_2 * c.voltage_rms * (2.0 * PI * c.frequency * t).sin();
+        let phase = 2.0 * PI * c.frequency * t + self.phase_offset;
+        let vs = SQRT_2 * c.voltage_rms * phase.sin();
         let return_injection = c.ac_return.as_ref().map_or(0.0, |driver| {
-            SQRT_2
-                * driver.current_rms_a
-                * (2.0 * PI * c.frequency * t + driver.phase_deg.to_radians()).sin()
+            SQRT_2 * driver.current_rms_a * (phase + driver.phase_deg.to_radians()).sin()
         });
         let gate = c.pulse_gate.as_ref().map_or(1.0, |g| g.level(t));
         let x = s[0];
@@ -559,12 +560,11 @@ impl Context<'_> {
         let leak = c.capacitor_leakage_parallel_ohm.map_or(0.0, |r| 1.0 / r);
         let gcl = c.load_capacitance;
         let cj = c.diode_capacitance_f;
+        let phase = 2.0 * PI * c.frequency * t + self.phase_offset;
         let return_injection = c.ac_return.as_ref().map_or(0.0, |driver| {
-            SQRT_2
-                * driver.current_rms_a
-                * (2.0 * PI * c.frequency * t + driver.phase_deg.to_radians()).sin()
+            SQRT_2 * driver.current_rms_a * (phase + driver.phase_deg.to_radians()).sin()
         });
-        let vs = SQRT_2 * c.voltage_rms * (2.0 * PI * c.frequency * t).sin();
+        let vs = SQRT_2 * c.voltage_rms * phase.sin();
         let mut m = [[0.0f64; 3]; 3];
         m[0] = [self.plug1 + gcl + cj, -gcl, -cj];
         m[1] = [-gcl, self.plug2 + gcl + cj, -cj];
@@ -719,6 +719,231 @@ impl Context<'_> {
             }
         }
         Ok((state, states))
+    }
+}
+
+/// Continuous time-domain integration from an initial zero-energy state. Unlike
+/// `simulate`, this never shoots or settles to a periodic orbit. The simulation
+/// clock advances only by integrated steps, not by wall-clock time.
+pub struct Transient {
+    circuit: Circuit,
+    cap_uf: f64,
+    state: State,
+    time_s: f64,
+    source_phase_offset: f64,
+    history: VecDeque<Trace>,
+    integration_steps: u64,
+}
+
+/// Retain more than the widest scope capture so crossings remain eligible
+/// across background integration chunks.
+pub const LIVE_HISTORY_SAMPLES: usize = 16_384;
+const LIVE_SCOPE_SAMPLES_PER_CYCLE: usize = 3072;
+
+fn transient_context(circuit: &Circuit, cap_uf: f64, phase_offset: f64) -> Context<'_> {
+    let mode = if circuit.source_inductance > 0.0 {
+        Drive::Source { with_l: true }
+    } else if circuit.diode_capacitance_f > 0.0 {
+        Drive::Source { with_l: false }
+    } else {
+        Drive::Stiff
+    };
+    let (layout, n) = layout_for(mode, circuit);
+    // Resolution follows the same pulse/dynamic heuristics as the periodic solver.
+    let base =
+        if circuit.frequency < 1000.0 && circuit.voltage_rms >= 100.0 && circuit.resistance <= 10.0
+        {
+            8192
+        } else if circuit.frequency < 1000.0 {
+            2048
+        } else if circuit.frequency == 1000.0 {
+            1024
+        } else {
+            512
+        };
+    let cap = cap_uf * 1e-6;
+    let pulse = (1.0
+        / circuit.frequency
+        / (2.0
+            * cap
+            * (circuit.source_resistance + circuit.diode_resistance + circuit.capacitor_esr_ohm)))
+        .ceil() as usize;
+    let dynamic = if mode == Drive::Stiff {
+        0
+    } else if circuit.pulse_gate.is_some() {
+        8192
+    } else {
+        4096
+    };
+    Context {
+        circuit,
+        plug1: cap,
+        plug2: cap * circuit.capacitor_ratio,
+        n,
+        layout,
+        mode,
+        period: 1.0 / circuit.frequency,
+        steps: base.max(pulse).max(dynamic).min(20_000),
+        phase_offset,
+    }
+}
+
+impl Transient {
+    pub fn new(circuit: Circuit, cap_uf: f64) -> Result<Self, String> {
+        circuit.validate()?;
+        if !cap_uf.is_finite() || cap_uf <= 0.0 {
+            return Err("Live C1 must be positive and finite".into());
+        }
+        let mut run = Self {
+            circuit,
+            cap_uf,
+            state: [0.0; 6],
+            time_s: 0.0,
+            source_phase_offset: 0.0,
+            history: VecDeque::with_capacity(LIVE_HISTORY_SAMPLES),
+            integration_steps: 0,
+        };
+        run.advance(0)?;
+        Ok(run)
+    }
+
+    pub fn time_s(&self) -> f64 {
+        self.time_s
+    }
+    pub fn capacitance_uf(&self) -> f64 {
+        self.cap_uf
+    }
+    pub fn circuit(&self) -> &Circuit {
+        &self.circuit
+    }
+    pub fn waveform(&self) -> Vec<Trace> {
+        self.history.iter().cloned().collect()
+    }
+
+    /// Change parameters at the current simulated instant, retaining capacitor
+    /// voltages and inductor currents. Changing an ideal component can inject or
+    /// remove energy; the operator's edit is an external intervention, not a
+    /// charge-conserving physical switch model.
+    pub fn reconfigure(&mut self, circuit: Circuit, cap_uf: f64) -> Result<(), String> {
+        circuit.validate()?;
+        if !cap_uf.is_finite() || cap_uf <= 0.0 {
+            return Err("Live C1 must be positive and finite".into());
+        }
+        let old = transient_context(&self.circuit, self.cap_uf, self.source_phase_offset);
+        let (_, instant) = old.evaluate(self.time_s, self.state)?;
+        let next_phase = (self.source_phase_offset
+            + 2.0 * PI * (self.circuit.frequency - circuit.frequency) * self.time_s)
+            .rem_euclid(2.0 * PI);
+        let next = transient_context(&circuit, cap_uf, next_phase);
+        let mut state = [0.0; 6];
+        state[0] = self.state[0];
+        state[1] = self.state[1];
+        if let Some(i) = next.layout.il {
+            state[i] = old.layout.il.map_or(instant.il, |j| self.state[j]);
+        }
+        if let Some(i) = next.layout.coil {
+            state[i] = old.layout.coil.map_or(instant.coil_a, |j| self.state[j]);
+        }
+        if let Some(i) = next.layout.va {
+            state[i] = instant.va;
+        }
+        next.evaluate(self.time_s, state)?;
+        self.circuit = circuit;
+        self.cap_uf = cap_uf;
+        self.source_phase_offset = next_phase;
+        self.state = state;
+        Ok(())
+    }
+
+    pub fn advance(&mut self, steps: usize) -> Result<(), String> {
+        if steps > 512 {
+            return Err("Live integration chunk exceeds 512 steps".into());
+        }
+        let circuit = self.circuit.clone();
+        let ctx = transient_context(&circuit, self.cap_uf, self.source_phase_offset);
+        // Keep roughly 3k recorded scope points per slowest configured cycle,
+        // including a slower pulse gate. The solver still takes every step.
+        let gate_ratio = circuit.pulse_gate.as_ref().map_or(1.0, |gate| {
+            (circuit.frequency / gate.repetition_hz).max(1.0)
+        });
+        let scope_stride =
+            ((ctx.steps as f64 * gate_ratio) / LIVE_SCOPE_SAMPLES_PER_CYCLE as f64).ceil() as u64;
+        let scope_stride = scope_stride.max(1);
+        for _ in 0..steps.max(1) {
+            let t = self.time_s;
+            let (_, z) = ctx.evaluate(t, self.state)?;
+            let x = self.state[0];
+            let y = self.state[1];
+            let il = ctx.layout.il;
+            let coil = ctx.layout.coil;
+            let load_a = z.il + circuit.load_capacitance * (z.dy - z.dx);
+            let trace = Trace {
+                time_s: t,
+                source_v: z.vs,
+                port_v: z.va,
+                node_p_v: z.va - x,
+                node_n_v: z.va - y,
+                load_v: y - x,
+                load_a,
+                input_a: z.input,
+                plug_input_a: z.plug_input,
+                return_injection_a: z.return_injection,
+                return_path_power_w: -z.va * z.return_injection,
+                diode_1_a: z.d1,
+                diode_2_a: z.d2,
+                capacitor_1_a: ctx.plug1 * z.dx,
+                capacitor_2_a: ctx.plug2 * z.dy,
+                load_capacitor_a: circuit.load_capacitance * (z.dy - z.dx),
+                input_power_w: z.vs * z.input,
+                port_power_w: z.va * z.input,
+                load_power_w: (y - x) * load_a,
+                capacitor_1_energy_j: 0.5 * ctx.plug1 * x * x,
+                capacitor_2_energy_j: 0.5 * ctx.plug2 * y * y,
+                load_capacitor_energy_j: 0.5 * circuit.load_capacitance * (y - x).powi(2),
+                load_inductor_energy_j: il
+                    .map_or(0.0, |i| 0.5 * circuit.inductance * self.state[i].powi(2)),
+                source_coil_a: z.coil_a,
+                source_coil_energy_j: coil.map_or(0.0, |i| {
+                    0.5 * circuit.source_inductance * self.state[i].powi(2)
+                }),
+            };
+            if !trace.source_v.is_finite()
+                || !trace.load_v.is_finite()
+                || !trace.input_a.is_finite()
+            {
+                return Err("Nonfinite live waveform".into());
+            }
+            if (steps == 0 || self.integration_steps.is_multiple_of(scope_stride))
+                && self.history.back().is_none_or(|last| last.time_s != t)
+            {
+                if self.history.len() == LIVE_HISTORY_SAMPLES {
+                    self.history.pop_front();
+                }
+                self.history.push_back(trace);
+            }
+            if steps == 0 {
+                break;
+            }
+            let dt = ctx.period / ctx.steps as f64;
+            let straddles = circuit
+                .pulse_gate
+                .as_ref()
+                .is_some_and(|g| g.level(t) != g.level(t + dt))
+                && ctx.mode != Drive::Stiff;
+            let next = if straddles {
+                let mut state = self.state;
+                for j in 0..8 {
+                    state = ctx.step(t + j as f64 * dt / 8.0, state, dt / 8.0)?;
+                }
+                state
+            } else {
+                ctx.step(t, self.state, dt)?
+            };
+            self.state = next;
+            self.time_s += dt;
+            self.integration_steps += 1;
+        }
+        Ok(())
     }
 }
 
@@ -888,6 +1113,7 @@ fn simulate_with_steps(
         period: 1.0 / circuit.frequency,
         steps: steps_override
             .unwrap_or_else(|| base_steps.max(pulse_steps).max(dynamic_steps).min(20_000)),
+        phase_offset: 0.0,
     };
     let (c1v, c2v, ilv, coil, vai) = (0, 1, layout.il, layout.coil, layout.va);
     let scale: [f64; 6] = {
@@ -1257,6 +1483,7 @@ pub fn ringdown(circuit: &Circuit, params: RingdownParams) -> Result<RingdownRes
         n,
         period: 1.0 / f0,
         steps: 4096,
+        phase_offset: 0.0,
     };
     let mut state = [0.0; 6];
     if let Some(i) = layout.va {
@@ -1397,6 +1624,89 @@ fn make_trace(ctx: &Context<'_>, time: f64, s: State) -> Trace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transient_keeps_state_and_time_when_controls_change() {
+        let mut c = circuit();
+        c.frequency = 1000.0;
+        let mut run = Transient::new(c.clone(), 1.0).unwrap();
+        assert_eq!(run.time_s(), 0.0);
+        assert_eq!(run.waveform().len(), 1);
+        run.advance(256).unwrap();
+        let before = run.state;
+        let time = run.time_s();
+        let old_source = transient_context(&run.circuit, run.cap_uf, run.source_phase_offset)
+            .evaluate(time, before)
+            .unwrap()
+            .1
+            .vs;
+        c.voltage_rms = 48.0;
+        c.frequency = 500.0;
+        c.resistance = 50.0;
+        run.reconfigure(c, 2.0).unwrap();
+        assert_eq!(run.time_s(), time);
+        assert_eq!(run.state[0], before[0]);
+        assert_eq!(run.state[1], before[1]);
+        let new_source = transient_context(&run.circuit, run.cap_uf, run.source_phase_offset)
+            .evaluate(time, run.state)
+            .unwrap()
+            .1
+            .vs;
+        assert!(
+            (new_source / 2.0 - old_source).abs() < 1e-7,
+            "source phase must not jump on frequency edit"
+        );
+        run.advance(128).unwrap();
+        assert!(run.time_s() > time);
+        assert!(run.waveform().windows(2).all(|w| w[1].time_s > w[0].time_s));
+        assert_eq!(run.capacitance_uf(), 2.0);
+    }
+
+    #[test]
+    fn transient_maps_inductors_and_dynamic_node_across_topology_changes() {
+        let mut c = circuit();
+        let mut run = Transient::new(c.clone(), 1.0).unwrap();
+        run.advance(128).unwrap();
+        let time = run.time_s();
+        c.inductance = 1e-3;
+        c.diode_capacitance_f = 1e-9;
+        c.source_inductance = 1e-3;
+        run.reconfigure(c, 1.0).unwrap();
+        assert_eq!(run.time_s(), time);
+        run.advance(64).unwrap();
+        assert!(run.waveform().iter().all(|w| w.source_v.is_finite()));
+        assert!(run.advance(513).is_err());
+        assert!(Transient::new(circuit(), -1.0).is_err());
+    }
+
+    #[test]
+    fn transient_chunking_advances_same_physical_state_without_periodic_reset() {
+        let c = circuit();
+        let mut together = Transient::new(c.clone(), 1.0).unwrap();
+        let mut split = Transient::new(c, 1.0).unwrap();
+        together.advance(256).unwrap();
+        split.advance(128).unwrap();
+        split.advance(128).unwrap();
+        assert!((together.time_s - split.time_s).abs() < 1e-15);
+        for (a, b) in together.state.iter().zip(split.state) {
+            assert!((a - b).abs() < 1e-9);
+        }
+        assert!(!together.waveform().is_empty());
+        assert_eq!(together.waveform().len(), split.waveform().len());
+        assert!(together.waveform().len() <= 256);
+        for (a, b) in together.waveform().iter().zip(split.waveform()) {
+            assert_eq!(
+                a.time_s, b.time_s,
+                "scope sampling must not depend on chunk boundaries"
+            );
+        }
+        assert!(
+            together
+                .waveform()
+                .iter()
+                .any(|sample| sample.capacitor_1_energy_j > 0.0)
+        );
+        assert_eq!(Transient::new(circuit(), 1.0).unwrap().time_s(), 0.0);
+    }
     fn circuit() -> Circuit {
         Circuit {
             voltage_rms: 24.0,
