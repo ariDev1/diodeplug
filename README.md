@@ -4,21 +4,46 @@ A desktop circuit simulator. Build and run it locally with Rust.
 
 ## Install and launch
 
-1. Install [Rust with rustup](https://rustup.rs/) (Rust 1.95 or newer). On Linux,
-   use an X11 or Wayland desktop with OpenGL support. On Debian/Ubuntu, install
-   the build dependencies with:
+You need Rust 1.95 or newer, Git, and a graphical desktop with OpenGL support.
+Install the prerequisites for your system:
 
-   ```sh
-   sudo apt install build-essential pkg-config libx11-dev libxcb1-dev libwayland-dev libxkbcommon-dev libgl1-mesa-dev
-   ```
+### Omarchy (Arch Linux)
 
-2. Clone and start the app:
+Open a terminal in your Omarchy desktop and run:
 
-   ```sh
-   git clone https://github.com/ariDev1/diodeplug.git
-   cd diodeplug
-   cargo run --release --locked
-   ```
+```sh
+sudo pacman -Syu --needed git base-devel wayland libxkbcommon libx11 libxcb mesa
+rustc --version
+```
+
+If `rustc` is missing, install Arch's Rust toolchain manager and select stable:
+
+```sh
+sudo pacman -S --needed rustup
+rustup default stable
+rustc --version
+```
+
+If Rust is already installed, use it if `rustc --version` is at least 1.95;
+otherwise update your existing toolchain (for rustup: `rustup update stable`).
+No `apt` commands are needed on Omarchy.
+
+### Debian / Ubuntu
+
+Install [Rust with rustup](https://rustup.rs/) (Rust 1.95 or newer), then:
+
+```sh
+sudo apt update
+sudo apt install git build-essential pkg-config libx11-dev libxcb1-dev libwayland-dev libxkbcommon-dev libgl1-mesa-dev
+```
+
+### Run (all systems)
+
+```sh
+git clone https://github.com/ariDev1/diodeplug.git
+cd diodeplug
+cargo run --release --locked
+```
 
 The first build downloads dependencies and may take a few minutes. Afterward,
 you can start the built app directly with `./target/release/diode-plug-lab`
