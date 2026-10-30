@@ -943,7 +943,7 @@ fn diode_model_summary(model: &DiodeModel) -> String {
         format!("{:.0} nC", model.qrr_nc)
     };
     format!(
-        "{} V / {} A avg · Vf0 {:.2} V · Rd {:.2} Ω · Cj {:.0} pF · Qrr {}",
+        "{} V / {} A avg · Vf0 {:.2} V · Rd {:.3} Ω · Cj {:.0} pF · Qrr {}",
         model.v_rrm_v,
         model.i_f_avg_a,
         model.vf0_v,

@@ -1,6 +1,6 @@
 //! Typical diode data for the piecewise-linear solver.
 //!
-//! Each entry is a convenience starting point derived from common datasheet
+//! Each entry is a convenience starting point derived from datasheet tables and
 //! curves. `vf0_v` is the extrapolated zero-current knee and `rd_ohm` is the
 //! slope resistance used by [`crate::solver::Circuit`]. Values are typical,
 //! not manufacturer-guaranteed limits; verify the exact part before treating a
@@ -14,7 +14,9 @@ pub struct DiodeModel {
     pub vf0_v: f64,
     /// Forward slope resistance.
     pub rd_ohm: f64,
-    /// Typical junction capacitance at a few volts reverse bias.
+    /// Typical junction capacitance at the datasheet test voltage (often a few
+    /// volts reverse bias; some high-voltage parts specify it at a much higher
+    /// voltage).
     pub cj_f: f64,
     /// Typical reverse-recovery charge per turn-off event.
     pub qrr_nc: f64,
@@ -97,6 +99,30 @@ pub const DIODE_MODELS: &[DiodeModel] = &[
         v_rrm_v: 600.0,
         i_f_avg_a: 4.0,
     },
+    // ON Semiconductor MUR480E/D Rev. 9 (MUR4100EG). The 25 °C curve fit
+    // reproduces the typical 3 A / 4 A forward points; Qrr is estimated from
+    // trr and the typical peak recovery current.
+    DiodeModel {
+        name: "MUR4100E",
+        vf0_v: 1.00,
+        rd_ohm: 0.10,
+        cj_f: 20e-12,
+        qrr_nc: 100.0,
+        v_rrm_v: 1000.0,
+        i_f_avg_a: 4.0,
+    },
+    // Vishay VS-HFA16PB120-N3, document 94057 Rev. 29-Nov-2019. Vf0/Rd fit
+    // the typical 16 A and 32 A forward points; Cj is the tabulated 27 pF at
+    // VR = 200 V, and Qrr is the typical 260 nC at 16 A and 200 A/µs.
+    DiodeModel {
+        name: "VS-HFA16PB120-N3",
+        vf0_v: 1.80,
+        rd_ohm: 0.04375,
+        cj_f: 27e-12,
+        qrr_nc: 260.0,
+        v_rrm_v: 1200.0,
+        i_f_avg_a: 16.0,
+    },
     DiodeModel {
         name: "1N5819",
         vf0_v: 0.38,
@@ -123,7 +149,7 @@ mod tests {
 
     #[test]
     fn common_diode_library_is_unique_and_plausible() {
-        assert!(DIODE_MODELS.len() >= 8);
+        assert!(DIODE_MODELS.len() >= 10);
         for (index, model) in DIODE_MODELS.iter().enumerate() {
             assert!(!model.name.is_empty());
             assert!(model.vf0_v >= 0.0 && model.vf0_v.is_finite());
@@ -158,5 +184,21 @@ mod tests {
         assert_eq!(schottky.qrr_nc, 0.0);
         assert!(schottky.vf0_v < 0.5);
         assert_eq!(schottky.v_rrm_v, 40.0);
+
+        // ON Semiconductor MUR4100EG: typical 25 °C curve near 3–4 A.
+        let mur = part("MUR4100E");
+        assert!((mur.vf0_v + 4.0 * mur.rd_ohm - 1.40).abs() < 0.02);
+        assert_eq!(mur.v_rrm_v, 1000.0);
+        assert_eq!(mur.i_f_avg_a, 4.0);
+        assert!((mur.qrr_nc - 100.0).abs() < 1e-12);
+
+        // Vishay VS-HFA16PB120-N3: typical 16 A and 32 A forward points.
+        let hfa = part("VS-HFA16PB120-N3");
+        assert!((hfa.vf0_v + 16.0 * hfa.rd_ohm - 2.5).abs() < 0.01);
+        assert!((hfa.vf0_v + 32.0 * hfa.rd_ohm - 3.2).abs() < 0.01);
+        assert_eq!(hfa.v_rrm_v, 1200.0);
+        assert_eq!(hfa.i_f_avg_a, 16.0);
+        assert!((hfa.qrr_nc - 260.0).abs() < 1e-12);
+        assert!((hfa.cj_f - 27e-12).abs() < 1e-24);
     }
 }

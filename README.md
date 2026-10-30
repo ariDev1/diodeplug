@@ -63,8 +63,9 @@ number without changing the circuit value.
 For component-level work, expand **Advanced · datasheet component data** to
 enter diode Vf0, Rd, Cj and Qrr, plus capacitor C2/C1, ESR and leakage. The
 diode picker includes common parts such as 1N4007, 1N5408, UF4007, MUR460,
-1N5819 and 1N5822. Library values are typical starting points; check the exact
-datasheet before treating a result as hardware validation.
+MUR4100E, VS-HFA16PB120-N3, 1N5819 and 1N5822. Library values are typical
+starting points; check the exact datasheet before treating a result as hardware
+validation.
 
 For explanations and limitations, open the offline **Docs** tab or read
 [the circuit guide](diode-plug_explained.md).
