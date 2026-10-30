@@ -53,8 +53,15 @@ you can start the built app directly with `./target/release/diode-plug-lab`
 
 The app opens in **Live**. Choose a preset in the left panel, then use **Play**,
 **Pause**, and **Restart from zero** to explore it. Use **Run sweep** to save
-results. For explanations and limitations, open the offline **Docs** tab or
-read [the circuit guide](diode-plug_explained.md).
+results.
+
+Inductance and capacitance fields have a unit selector. A bare number uses the
+selected unit (for example `470` with `µF`); an explicit suffix such as
+`470uF`, `0.1H`, or `10nF` overrides it. Switching units converts the displayed
+number without changing the circuit value.
+
+For explanations and limitations, open the offline **Docs** tab or read
+[the circuit guide](diode-plug_explained.md).
 
 For a command-line run without a window:
 

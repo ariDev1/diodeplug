@@ -746,6 +746,7 @@ struct LabApp {
     live: LiveRun,
     trigger: LiveTrigger,
     scope: LiveScopeSettings,
+    component_units: [usize; 6],
     preset: Option<usize>,
     reset_pending: bool,
     document: usize,
@@ -849,6 +850,133 @@ const LABELS: [(&str, &str); 12] = [
     ("CPU workers (0 = auto)", ""),
 ];
 
+#[derive(Clone, Copy)]
+struct ComponentUnit {
+    label: &'static str,
+    scale: f64,
+}
+
+const HENRY_UNITS: [ComponentUnit; 3] = [
+    ComponentUnit {
+        label: "H",
+        scale: 1.0,
+    },
+    ComponentUnit {
+        label: "mH",
+        scale: 1e-3,
+    },
+    ComponentUnit {
+        label: "µH",
+        scale: 1e-6,
+    },
+];
+const FARAD_UNITS: [ComponentUnit; 5] = [
+    ComponentUnit {
+        label: "F",
+        scale: 1.0,
+    },
+    ComponentUnit {
+        label: "mF",
+        scale: 1e-3,
+    },
+    ComponentUnit {
+        label: "µF",
+        scale: 1e-6,
+    },
+    ComponentUnit {
+        label: "nF",
+        scale: 1e-9,
+    },
+    ComponentUnit {
+        label: "pF",
+        scale: 1e-12,
+    },
+];
+const LOAD_L_UNIT: usize = 0;
+const LOAD_C_UNIT: usize = 1;
+const SOURCE_L_UNIT: usize = 2;
+const DIODE_C_UNIT: usize = 3;
+const TANK_L_UNIT: usize = 4;
+const TANK_C_UNIT: usize = 5;
+const DEFAULT_COMPONENT_UNITS: [usize; 6] = [1, 2, 1, 4, 1, 3];
+
+fn component_value(
+    text: &str,
+    kind: Unit,
+    choice: usize,
+    options: &[ComponentUnit],
+) -> Result<f64, String> {
+    units::parse(text, kind, options[choice].scale)
+}
+
+/// Format a component value for an input field, trimming floating-point noise.
+fn format_component(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    if value == 0.0 {
+        return "0".into();
+    }
+    let magnitude = value.abs();
+    if !(1e-6..1e9).contains(&magnitude) {
+        let mantissa = format!("{value:.8e}");
+        let (mantissa, exponent) = mantissa.split_once('e').unwrap_or((&mantissa, "0"));
+        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
+        return format!("{mantissa}e{}", exponent.trim_start_matches('+'));
+    }
+    // Keep about a dozen significant digits, so a unit conversion such as
+    // µF → nF shows 470000 instead of 469999.99999999994 while still
+    // preserving small values such as 1.234567 µF.
+    let decimals = (12 - magnitude.log10().floor() as i32).clamp(0, 24) as usize;
+    let mut text = format!("{value:.decimals$}");
+    if text.contains('.') {
+        text = text.trim_end_matches('0').trim_end_matches('.').to_owned();
+    }
+    text
+}
+
+fn select_component_unit(
+    text: &mut String,
+    current: &mut usize,
+    next: usize,
+    kind: Unit,
+    options: &[ComponentUnit],
+) -> Result<(), String> {
+    let value = component_value(text, kind, *current, options)?;
+    *text = format_component(value / options[next].scale);
+    *current = next;
+    Ok(())
+}
+
+fn component_unit_selector(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    text: &mut String,
+    current: &mut usize,
+    kind: Unit,
+    options: &[ComponentUnit],
+) {
+    let mut next = *current;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(options[*current].label)
+        .width(52.0)
+        .show_ui(ui, |ui| {
+            for (index, option) in options.iter().enumerate() {
+                ui.selectable_value(&mut next, index, option.label);
+            }
+        })
+        .response
+        .on_hover_text(
+            "Unit for bare numbers; an explicit SI suffix in the value takes precedence",
+        );
+    if next != *current
+        && let Err(error) = select_component_unit(text, current, next, kind, options)
+    {
+        ui.label(RichText::new("Fix value first").color(ORANGE))
+            .on_hover_text(error);
+    }
+}
+
 impl LabApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         Self::new_with_ctx(&cc.egui_ctx)
@@ -897,8 +1025,13 @@ impl LabApp {
         ];
         let (sender, receiver) = mpsc::channel();
         let source_frequency = c.circuit.frequency.to_string();
+        let mut form = values.map(|v| v.to_string());
+        form[3] =
+            format_component(values[3] / HENRY_UNITS[DEFAULT_COMPONENT_UNITS[LOAD_L_UNIT]].scale);
+        form[4] =
+            format_component(values[4] / FARAD_UNITS[DEFAULT_COMPONENT_UNITS[LOAD_C_UNIT]].scale);
         Self {
-            form: values.map(|v| v.to_string()),
+            form,
             reference: c.reference_ohms.unwrap().to_string(),
             parent: "results".into(),
             config: c,
@@ -922,6 +1055,7 @@ impl LabApp {
             live: LiveRun::new(),
             trigger: LiveTrigger::new(),
             scope: LiveScopeSettings::new(),
+            component_units: DEFAULT_COMPONENT_UNITS,
             preset: None,
             reset_pending: false,
             document: 0,
@@ -932,8 +1066,8 @@ impl LabApp {
             return_enabled: false,
             return_current: "0.1A".into(),
             return_phase: "0".into(),
-            tank_l: "1mH".into(),
-            tank_c: "10nF".into(),
+            tank_l: "1".into(),
+            tank_c: "10".into(),
             tank_g: "1mS".into(),
             pulse_v: "34V".into(),
             pulse_f: "50Hz".into(),
@@ -952,7 +1086,7 @@ impl LabApp {
             observed_q: String::new(),
             fit_observed: false,
             l_source_enabled: false,
-            l_source: "0H".into(),
+            l_source: "0".into(),
             cap_advanced: false,
             cap_ratio_form: "1".into(),
             cap_esr_form: "0".into(),
@@ -997,6 +1131,10 @@ impl LabApp {
             self.config.workers as f64,
         ];
         self.form = values.map(|v| v.to_string());
+        self.form[3] =
+            format_component(values[3] / HENRY_UNITS[self.component_units[LOAD_L_UNIT]].scale);
+        self.form[4] =
+            format_component(values[4] / FARAD_UNITS[self.component_units[LOAD_C_UNIT]].scale);
         self.reference = c.reference_ohms.map_or(String::new(), |z| z.to_string());
         match c.circuit.load_model {
             LoadModel::Linear => {
@@ -1024,7 +1162,9 @@ impl LabApp {
             self.return_phase = ret.phase_deg.to_string();
         }
         self.l_source_enabled = c.circuit.source_inductance > 0.0;
-        self.l_source = format!("{}H", c.circuit.source_inductance);
+        self.l_source = format_component(
+            c.circuit.source_inductance / HENRY_UNITS[self.component_units[SOURCE_L_UNIT]].scale,
+        );
         self.cap_advanced = c.circuit.capacitor_ratio != 1.0
             || c.circuit.capacitor_esr_ohm != 0.0
             || c.circuit.diode_capacitance_f != 0.0
@@ -1036,7 +1176,9 @@ impl LabApp {
             .circuit
             .capacitor_leakage_parallel_ohm
             .map_or(String::new(), |r| format!("{}MOhm", r / 1e6));
-        self.diode_cap_form = format!("{}pF", c.circuit.diode_capacitance_f * 1e12);
+        self.diode_cap_form = format_component(
+            c.circuit.diode_capacitance_f / FARAD_UNITS[self.component_units[DIODE_C_UNIT]].scale,
+        );
         self.diode_qrr_form = format!("{}", c.circuit.diode_recovery_charge_nc);
         self.gate_enabled = c.circuit.pulse_gate.is_some();
         if let Some(gate) = &c.circuit.pulse_gate {
@@ -1082,6 +1224,13 @@ impl LabApp {
             c.workers as f64,
         ]
         .map(|value| value.to_string());
+        self.component_units = DEFAULT_COMPONENT_UNITS;
+        self.form[3] = format_component(
+            c.circuit.inductance / HENRY_UNITS[self.component_units[LOAD_L_UNIT]].scale,
+        );
+        self.form[4] = format_component(
+            c.circuit.load_capacitance / FARAD_UNITS[self.component_units[LOAD_C_UNIT]].scale,
+        );
         self.reference = c.reference_ohms.unwrap().to_string();
         self.measurement_path.clear();
         self.measurement_frequency = c.circuit.frequency.to_string();
@@ -1095,7 +1244,7 @@ impl LabApp {
         self.return_current = "0.1A".into();
         self.return_phase = "0".into();
         self.l_source_enabled = false;
-        self.l_source = "0H".into();
+        self.l_source = "0".into();
         self.cap_advanced = false;
         self.cap_ratio_form = "1".into();
         self.cap_esr_form = "0".into();
@@ -1105,8 +1254,8 @@ impl LabApp {
         self.gate_enabled = false;
         self.gate_rep_form = "50Hz".into();
         self.gate_duty_form = "0.5".into();
-        self.tank_l = "1mH".into();
-        self.tank_c = "10nF".into();
+        self.tank_l = "1".into();
+        self.tank_c = "10".into();
         self.tank_g = "1mS".into();
         self.pulse_v = "34V".into();
         self.pulse_f = "50Hz".into();
@@ -1328,7 +1477,12 @@ impl LabApp {
             Unit::Farad,
         ];
         for i in 0..if live { 8 } else { 10 } {
-            let scale = if i == 8 || i == 9 { 1e-6 } else { 1.0 };
+            let scale = match i {
+                3 => HENRY_UNITS[self.component_units[LOAD_L_UNIT]].scale,
+                4 => FARAD_UNITS[self.component_units[LOAD_C_UNIT]].scale,
+                8 | 9 => 1e-6,
+                _ => 1.0,
+            };
             let value = units::parse(&self.form[i], units[i], scale)
                 .map_err(|e| format!("{}: {e}", LABELS[i].0))?;
             v[i] = if i == 8 || i == 9 {
@@ -1433,8 +1587,13 @@ impl LabApp {
                 load_model,
                 ac_return,
                 source_inductance: if self.l_source_enabled {
-                    units::parse(&self.l_source, Unit::Henry, 1.0)
-                        .map_err(|e| format!("Ls: {e}"))?
+                    component_value(
+                        &self.l_source,
+                        Unit::Henry,
+                        self.component_units[SOURCE_L_UNIT],
+                        &HENRY_UNITS,
+                    )
+                    .map_err(|e| format!("Ls: {e}"))?
                 } else {
                     0.0
                 },
@@ -1461,8 +1620,13 @@ impl LabApp {
                     None
                 },
                 diode_capacitance_f: if self.cap_advanced {
-                    units::parse(&self.diode_cap_form, Unit::Farad, 1.0)
-                        .map_err(|e| format!("Diode Cj: {e}"))?
+                    component_value(
+                        &self.diode_cap_form,
+                        Unit::Farad,
+                        self.component_units[DIODE_C_UNIT],
+                        &FARAD_UNITS,
+                    )
+                    .map_err(|e| format!("Diode Cj: {e}"))?
                 } else {
                     0.0
                 },
@@ -1878,7 +2042,8 @@ impl LabApp {
                 ui.horizontal(|ui| {
                     ui.label("Ls");
                     ui.add(egui::TextEdit::singleline(&mut self.l_source).desired_width(78.0));
-                    ui.label("H");
+                    component_unit_selector(ui, "source_l_unit", &mut self.l_source,
+                        &mut self.component_units[SOURCE_L_UNIT], Unit::Henry, &HENRY_UNITS);
                 });
                 ui.small("Requires junction capacitance Cj > 0; clamp-node transient becomes dynamic.");
             }
@@ -1902,7 +2067,8 @@ impl LabApp {
                 ui.horizontal(|ui| {
                     ui.label("Diode Cj");
                     ui.add(egui::TextEdit::singleline(&mut self.diode_cap_form).desired_width(78.0));
-                    ui.label("F");
+                    component_unit_selector(ui, "diode_c_unit", &mut self.diode_cap_form,
+                        &mut self.component_units[DIODE_C_UNIT], Unit::Farad, &FARAD_UNITS);
                 });
                 ui.horizontal(|ui| {
                     ui.label("Qrr");
@@ -1938,7 +2104,7 @@ impl LabApp {
                 });
                 ui.label(RichText::new("External powered switched-return equivalent; reported total G includes this driver. Plug-only G is listed separately.").small().color(ORANGE));
             }
-            ui.small("SI suffixes accepted: 5uH · 10pF · 1mOhm · 2.4kΩ");
+            ui.small("Bare L/C values use the selected unit; SI suffixes such as 5uH and 10pF override it.");
             ui.add_space(10.0);
             ui.heading(RichText::new("Capacitance sweep").size(16.0));
             ui.small("C2 follows C1 (equal unless a ratio is set under parasitics).");
@@ -2028,7 +2194,27 @@ impl LabApp {
             }
             #[cfg(not(test))]
             let _ = (label, edit);
-            ui.small(LABELS[i].1);
+            match i {
+                3 => component_unit_selector(
+                    ui,
+                    "load_l_unit",
+                    &mut self.form[i],
+                    &mut self.component_units[LOAD_L_UNIT],
+                    Unit::Henry,
+                    &HENRY_UNITS,
+                ),
+                4 => component_unit_selector(
+                    ui,
+                    "load_c_unit",
+                    &mut self.form[i],
+                    &mut self.component_units[LOAD_C_UNIT],
+                    Unit::Farad,
+                    &FARAD_UNITS,
+                ),
+                _ => {
+                    ui.small(LABELS[i].1);
+                }
+            }
         });
     }
 
@@ -3457,17 +3643,43 @@ impl LabApp {
     fn reference_equations(&mut self, ui: &mut egui::Ui) {
         ui.heading("Resonant tank · fundamental equivalent");
         ui.label("Enter tank components to combine them with the selected plug's operating-point admittance.");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Tank L");
             ui.add(egui::TextEdit::singleline(&mut self.tank_l).desired_width(75.0));
+            component_unit_selector(
+                ui,
+                "tank_l_unit",
+                &mut self.tank_l,
+                &mut self.component_units[TANK_L_UNIT],
+                Unit::Henry,
+                &HENRY_UNITS,
+            );
             ui.label("Tank C");
             ui.add(egui::TextEdit::singleline(&mut self.tank_c).desired_width(75.0));
+            component_unit_selector(
+                ui,
+                "tank_c_unit",
+                &mut self.tank_c,
+                &mut self.component_units[TANK_C_UNIT],
+                Unit::Farad,
+                &FARAD_UNITS,
+            );
             ui.label("Loss G");
             ui.add(egui::TextEdit::singleline(&mut self.tank_g).desired_width(75.0));
         });
         if let Some(point) = self.selected_result() {
-            let l = units::parse(&self.tank_l, Unit::Henry, 1.0);
-            let c = units::parse(&self.tank_c, Unit::Farad, 1.0);
+            let l = component_value(
+                &self.tank_l,
+                Unit::Henry,
+                self.component_units[TANK_L_UNIT],
+                &HENRY_UNITS,
+            );
+            let c = component_value(
+                &self.tank_c,
+                Unit::Farad,
+                self.component_units[TANK_C_UNIT],
+                &FARAD_UNITS,
+            );
             let g = units::parse(&self.tank_g, Unit::Siemens, 1.0);
             match (|| {
                 let l = l?;
@@ -3557,8 +3769,18 @@ impl LabApp {
         });
         if ui.button("Run ringdown").clicked() {
             let outcome = (|| {
-                let l = units::parse(&self.tank_l, Unit::Henry, 1.0)?;
-                let c = units::parse(&self.tank_c, Unit::Farad, 1.0)?;
+                let l = component_value(
+                    &self.tank_l,
+                    Unit::Henry,
+                    self.component_units[TANK_L_UNIT],
+                    &HENRY_UNITS,
+                )?;
+                let c = component_value(
+                    &self.tank_c,
+                    Unit::Farad,
+                    self.component_units[TANK_C_UNIT],
+                    &FARAD_UNITS,
+                )?;
                 let g = units::parse(&self.tank_g, Unit::Siemens, 1.0)?;
                 let v = units::parse(&self.ring_start_v, Unit::Volt, 1.0)?;
                 let cycles = units::parse(&self.ring_cycles, Unit::Unitless, 1.0)? as usize;
@@ -6302,13 +6524,76 @@ mod ui_tests {
         assert_eq!(config.workers, 0);
         assert_eq!(config.reference_ohms, Some(10.0));
         assert_eq!(h.app.parent, "results");
-        assert_eq!(h.app.tank_l, "1mH");
+        assert_eq!(h.app.tank_l, "1");
+        assert_eq!(h.app.component_units, DEFAULT_COMPONENT_UNITS);
         assert!(h.app.measurement_path.is_empty());
         assert_eq!(config.preset_name, None);
         assert!(config.operator.is_empty() && config.run_id.is_empty());
         assert!(!h.app.observed_enabled && !h.app.cap_advanced && !h.app.return_enabled);
         assert!(!h.app.reset_pending);
         assert!(h.app.selected_result().is_some());
+    }
+
+    #[test]
+    fn component_unit_selectors_keep_physical_values_and_accept_suffixes() {
+        assert_eq!(
+            component_value("470", Unit::Farad, 2, &FARAD_UNITS).unwrap(),
+            470e-6
+        );
+        assert_eq!(
+            component_value("470uF", Unit::Farad, 2, &FARAD_UNITS).unwrap(),
+            470e-6
+        );
+        assert_eq!(
+            component_value("0.1mH", Unit::Henry, 0, &HENRY_UNITS).unwrap(),
+            100e-6
+        );
+        assert_eq!(
+            component_value("100", Unit::Henry, 1, &HENRY_UNITS).unwrap(),
+            0.1
+        );
+
+        let mut text = "470".to_string();
+        let mut unit = 2; // µF
+        select_component_unit(&mut text, &mut unit, 3, Unit::Farad, &FARAD_UNITS).unwrap();
+        assert_eq!(text, "470000");
+        assert_eq!(unit, 3);
+        assert!(
+            (component_value(&text, Unit::Farad, unit, &FARAD_UNITS).unwrap() - 470e-6).abs()
+                < 1e-15
+        );
+        select_component_unit(&mut text, &mut unit, 0, Unit::Farad, &FARAD_UNITS).unwrap();
+        assert_eq!(text, "0.00047");
+
+        let mut invalid = "not a value".to_string();
+        let mut unchanged = 2;
+        assert!(
+            select_component_unit(&mut invalid, &mut unchanged, 4, Unit::Farad, &FARAD_UNITS)
+                .is_err()
+        );
+        assert_eq!(unchanged, 2);
+    }
+
+    #[test]
+    fn presets_and_live_use_their_selected_component_units() {
+        let mut h = Harness::new();
+        h.app.live.playing = false;
+        let battery = presets::all()
+            .iter()
+            .position(|preset| preset.name == "24 V battery charging proxy")
+            .expect("battery preset");
+        h.app.apply_preset(battery);
+        assert_eq!(h.app.form[4], "470");
+        assert_eq!(h.app.component_units[LOAD_C_UNIT], 2);
+        let circuit = h.app.read_live_circuit().unwrap();
+        assert!((circuit.load_capacitance - 470e-6).abs() < 1e-18);
+        h.app.component_units[LOAD_C_UNIT] = 3; // Switch to nF: bare value now means nF.
+        h.app.form[4] = "220".into();
+        let circuit = h.app.read_live_circuit().unwrap();
+        assert!((circuit.load_capacitance - 220e-9).abs() < 1e-18);
+        h.app.form[4] = "0.47uF".into(); // Explicit suffix still wins.
+        let circuit = h.app.read_live_circuit().unwrap();
+        assert!((circuit.load_capacitance - 470e-9).abs() < 1e-18);
     }
 
     #[test]
