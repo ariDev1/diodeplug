@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod capacitors;
 pub mod components;
 pub mod export;
 pub mod measurement;

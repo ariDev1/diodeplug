@@ -1,4 +1,5 @@
 use diode_plug_lab::analysis;
+use diode_plug_lab::capacitors::{CAPACITOR_MODELS, CapacitorModel};
 use diode_plug_lab::components::{DIODE_MODELS, DiodeModel};
 use diode_plug_lab::export;
 use diode_plug_lab::measurement;
@@ -781,6 +782,8 @@ struct LabApp {
     cap_ratio_form: String,
     cap_esr_form: String,
     cap_leakage_form: String,
+    /// Last preset picked, so electrically identical presets stay distinguishable.
+    capacitor_choice: Option<usize>,
     diode_cap_form: String,
     diode_qrr_form: String,
     gate_enabled: bool,
@@ -953,6 +956,56 @@ fn diode_model_summary(model: &DiodeModel) -> String {
     )
 }
 
+fn frequency_text(hz: f64) -> String {
+    if hz >= 1e3 {
+        format!("{} kHz", format_component(hz / 1e3))
+    } else {
+        format!("{} Hz", format_component(hz))
+    }
+}
+
+fn resistance_text(ohms: f64) -> String {
+    if ohms >= 1e9 {
+        format!("{:.1} GΩ", ohms / 1e9)
+    } else if ohms >= 1e6 {
+        format!("{:.1} MΩ", ohms / 1e6)
+    } else {
+        format!("{} Ω", format_component(ohms))
+    }
+}
+
+fn esr_text(ohms: f64) -> String {
+    if ohms >= 1.0 {
+        format!("{ohms:.2}")
+    } else if ohms >= 0.1 {
+        format!("{ohms:.3}")
+    } else if ohms >= 0.01 {
+        format!("{ohms:.4}")
+    } else {
+        format!("{ohms:.5}")
+    }
+}
+
+fn capacitor_model_summary(model: &CapacitorModel) -> String {
+    let rating = format!(
+        "{:.0} {}",
+        model.rated_voltage_v,
+        if model.rated_ac { "VAC" } else { "VDC" }
+    );
+    let leakage = model.leakage_parallel_ohm.map_or_else(
+        || "leakage not set".to_owned(),
+        |r| format!("IR ≥ {}", resistance_text(r)),
+    );
+    format!(
+        "{} · ESR {} Ω @ {} (tanδ ≤ {}) · {}",
+        rating,
+        esr_text(model.esr_ohm()),
+        frequency_text(model.esr_frequency_hz),
+        format_component(model.tan_delta),
+        leakage,
+    )
+}
+
 fn select_component_unit(
     text: &mut String,
     current: &mut usize,
@@ -1109,6 +1162,7 @@ impl LabApp {
             cap_ratio_form: "1".into(),
             cap_esr_form: "0".into(),
             cap_leakage_form: String::new(),
+            capacitor_choice: None,
             diode_cap_form: "0".into(),
             diode_qrr_form: "0".into(),
             gate_enabled: false,
@@ -1194,6 +1248,7 @@ impl LabApp {
             .circuit
             .capacitor_leakage_parallel_ohm
             .map_or(String::new(), |r| format!("{}MOhm", r / 1e6));
+        self.capacitor_choice = None;
         self.diode_cap_form = format_component(
             c.circuit.diode_capacitance_f / FARAD_UNITS[self.component_units[DIODE_C_UNIT]].scale,
         );
@@ -1267,6 +1322,7 @@ impl LabApp {
         self.cap_ratio_form = "1".into();
         self.cap_esr_form = "0".into();
         self.cap_leakage_form.clear();
+        self.capacitor_choice = None;
         self.diode_cap_form = "0".into();
         self.diode_qrr_form = "0".into();
         self.gate_enabled = false;
@@ -2026,6 +2082,8 @@ impl LabApp {
                 self.field(ui, i);
             }
             ui.add_space(4.0);
+            ui.label(RichText::new("COMPONENT PRESETS").size(10.0).color(MUTED));
+            self.capacitor_model_picker(ui);
             self.diode_model_picker(ui);
             egui::ComboBox::from_label("Load branch model")
                 .selected_text(match self.model_kind {
@@ -2112,7 +2170,7 @@ impl LabApp {
                     ui.add_space(6.0);
                     ui.label(RichText::new("PLUG CAPACITORS").size(10.0).color(MUTED));
                     ui.small(
-                        "C1 is set above. C2 = ratio × C1. ESR and leakage are per capacitor.",
+                        "C1 is set above or by the capacitor preset. C2 = ratio × C1. ESR and leakage are per capacitor.",
                     );
                     ui.horizontal(|ui| {
                         ui.label("C2 ratio");
@@ -2138,7 +2196,7 @@ impl LabApp {
                         ui.label("Ω (blank = none)");
                     });
                     ui.small(
-                        "Film: ESR 0.005–0.02 Ω, leakage ≥1 GΩ. Electrolytic: ESR 0.05–0.5 Ω, leakage ~0.1–1 MΩ.",
+                        "ESR is frequency-dependent. Film: ~0.005–0.02 Ω at high frequency, but ~0.2–1 Ω at 50 Hz for motor-run µF values. Film leakage ≥1 GΩ; electrolytic ~0.1–1 MΩ.",
                     );
                 });
             }
@@ -2347,6 +2405,96 @@ impl LabApp {
         } else {
             ui.label(
                 RichText::new("Choose a typical part, or enter datasheet values under Advanced.")
+                    .small()
+                    .color(MUTED),
+            );
+        }
+        ui.add_space(4.0);
+    }
+
+    fn current_capacitor_model(&self) -> Option<usize> {
+        let capacitance = component_value(
+            &self.form[4],
+            Unit::Farad,
+            self.component_units[LOAD_C_UNIT],
+            &FARAD_UNITS,
+        )
+        .ok()?;
+        let esr = units::parse(&self.cap_esr_form, Unit::Ohm, 1.0).ok()?;
+        let leakage = if self.cap_leakage_form.trim().is_empty() {
+            None
+        } else {
+            Some(units::parse(&self.cap_leakage_form, Unit::Ohm, 1.0).ok()?)
+        };
+        if let Some(index) = self.capacitor_choice
+            && CAPACITOR_MODELS
+                .get(index)
+                .is_some_and(|model| model.matches(capacitance, esr, leakage))
+        {
+            return Some(index);
+        }
+        CAPACITOR_MODELS
+            .iter()
+            .position(|model| model.matches(capacitance, esr, leakage))
+    }
+
+    fn apply_capacitor_model(&mut self, index: usize) {
+        let Some(model) = CAPACITOR_MODELS.get(index) else {
+            return;
+        };
+        self.form[4] = format_component(
+            model.capacitance_f / FARAD_UNITS[self.component_units[LOAD_C_UNIT]].scale,
+        );
+        self.cap_esr_form = format_component(model.esr_ohm());
+        self.cap_leakage_form = model
+            .leakage_parallel_ohm
+            .map(format_component)
+            .unwrap_or_default();
+        self.capacitor_choice = Some(index);
+        self.cap_advanced = true;
+        self.status = format!("Loaded capacitor preset: {}", model.name);
+        self.status_error = false;
+    }
+
+    fn capacitor_model_picker(&mut self, ui: &mut egui::Ui) {
+        let mut current = self.current_capacitor_model();
+        let mut choice = current;
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [158.0, 22.0],
+                egui::Label::new("Capacitor preset").halign(egui::Align::Min),
+            );
+            egui::ComboBox::from_id_salt("capacitor_model")
+                .selected_text(current.map_or("Custom / datasheet", |i| CAPACITOR_MODELS[i].name))
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    for (index, model) in CAPACITOR_MODELS.iter().enumerate() {
+                        if index == 0 || model.group != CAPACITOR_MODELS[index - 1].group {
+                            ui.label(RichText::new(model.group).size(10.0).color(MUTED));
+                        }
+                        ui.selectable_value(&mut choice, Some(index), model.name);
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Sets C1, ESR and leakage. C2 still follows the C2 ratio under Advanced.",
+                );
+        });
+        if choice != current
+            && let Some(index) = choice
+        {
+            self.apply_capacitor_model(index);
+            current = Some(index);
+        }
+        if let Some(index) = current {
+            ui.label(
+                RichText::new(capacitor_model_summary(&CAPACITOR_MODELS[index]))
+                    .small()
+                    .color(MUTED),
+            );
+        } else {
+            ui.label(
+                RichText::new("Choose a typical part, or enter C1 and parasitics under Advanced.")
                     .small()
                     .color(MUTED),
             );
@@ -6753,6 +6901,41 @@ mod ui_tests {
         // Editing a datasheet value switches the picker to Custom.
         h.app.form[7] = "0.2".into();
         assert_eq!(h.app.current_diode_model(), None);
+    }
+
+    #[test]
+    fn capacitor_preset_populates_c1_and_advanced_parasitics() {
+        let mut h = Harness::new();
+        h.app.live.playing = false;
+        h.app.cap_ratio_form = "0.5".into();
+        let index = CAPACITOR_MODELS
+            .iter()
+            .position(|model| model.name == "WIMA MKP 10 · 1 µF / 630 VDC")
+            .expect("MKP 10 model");
+        h.app.apply_capacitor_model(index);
+        assert!(h.app.cap_advanced);
+        assert_eq!(h.app.current_capacitor_model(), Some(index));
+
+        let circuit = h.app.read_live_circuit().unwrap();
+        assert!((circuit.load_capacitance - 1e-6).abs() < 1e-15);
+        assert!((circuit.capacitor_esr_ohm - 0.009_549_3).abs() < 1e-8);
+        assert_eq!(circuit.capacitor_leakage_parallel_ohm, Some(3e10));
+        assert_eq!(circuit.capacitor_ratio, 0.5);
+
+        // Every preset round-trips through the displayed input fields.
+        for (index, model) in CAPACITOR_MODELS.iter().enumerate() {
+            h.app.apply_capacitor_model(index);
+            assert_eq!(
+                h.app.current_capacitor_model(),
+                Some(index),
+                "{} did not round-trip",
+                model.name
+            );
+        }
+
+        // Editing C1 switches the picker to Custom.
+        h.app.form[4] = "2.2".into();
+        assert_eq!(h.app.current_capacitor_model(), None);
     }
 
     #[test]
