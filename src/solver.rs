@@ -979,6 +979,7 @@ pub struct DischargeCycle {
 
 #[derive(Clone, Debug)]
 pub struct PrechargedDischarge {
+    pub capacitance_each_uf: f64,
     pub initial_energy_j: f64,
     pub cycles: Vec<DischargeCycle>,
     pub waveform: Vec<Trace>,
@@ -1102,6 +1103,7 @@ pub fn precharged_discharge(
         }
     }
     Ok(PrechargedDischarge {
+        capacitance_each_uf: cap_uf,
         initial_energy_j,
         cycles: summaries,
         waveform,

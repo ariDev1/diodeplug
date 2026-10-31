@@ -65,8 +65,9 @@ enter diode Vf0, Rd, Cj and Qrr, plus capacitor C2/C1, ESR and leakage. The
 diode picker includes common parts such as 1N4007, 1N5408, UF4007, MUR460,
 MUR4100E, VS-HFA16PB120-N3, 1N5819 and 1N5822. The capacitor presets cover
 CBB65 motor-run capacitors (450 VAC) and WIMA MKP 10, MKP 4 and FKP 1 film
-capacitors. A capacitor preset fills C1, ESR and leakage; C2 still follows the
-C2 ratio. Capacitor ESR is calculated from the datasheet tanδ at the stated
+capacitors. A capacitor preset fills **Live plug C1**, ESR and leakage; C2 still
+follows the C2 ratio. The separate load-parallel C and sweep limits are unchanged.
+Capacitor ESR is calculated from the datasheet tanδ at the stated
 frequency, so recalculate it for a different operating frequency. Library
 values are typical starting points; check the exact datasheet before treating
 a result as hardware validation.

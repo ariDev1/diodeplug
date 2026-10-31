@@ -797,6 +797,8 @@ struct LabApp {
     discharge_c1_v: String,
     discharge_c2_v: String,
     discharge_cycles: String,
+    experiment_page: usize,
+    probe_use_selected_c1: bool,
     precharged_result: Option<diode_plug_lab::solver::PrechargedDischarge>,
     precharged_message: String,
     discharge_result: Option<diode_plug_lab::analysis::DischargeResult>,
@@ -1181,6 +1183,8 @@ impl LabApp {
             discharge_c1_v: "100V".into(),
             discharge_c2_v: "100V".into(),
             discharge_cycles: "3".into(),
+            experiment_page: 0,
+            probe_use_selected_c1: false,
             precharged_result: None,
             precharged_message: String::new(),
             discharge_result: None,
@@ -1349,6 +1353,8 @@ impl LabApp {
         self.discharge_c1_v = "100V".into();
         self.discharge_c2_v = "100V".into();
         self.discharge_cycles = "3".into();
+        self.experiment_page = 0;
+        self.probe_use_selected_c1 = false;
         self.precharged_result = None;
         self.precharged_message.clear();
         self.discharge_single_cap = true;
@@ -2185,7 +2191,7 @@ impl LabApp {
                     ui.add_space(6.0);
                     ui.label(RichText::new("PLUG CAPACITORS").size(10.0).color(MUTED));
                     ui.small(
-                        "C1 is set above or by the capacitor preset. C2 = ratio × C1. ESR and leakage are per capacitor.",
+                        "Plug C1 is set in Live or by the plug C1 preset. C2 = ratio × C1. Sweep C1 comes from the sweep range; Load parallel C is separate.",
                     );
                     ui.horizontal(|ui| {
                         ui.label("C2 ratio");
@@ -2428,13 +2434,10 @@ impl LabApp {
     }
 
     fn current_capacitor_model(&self) -> Option<usize> {
-        let capacitance = component_value(
-            &self.form[4],
-            Unit::Farad,
-            self.component_units[LOAD_C_UNIT],
-            &FARAD_UNITS,
-        )
-        .ok()?;
+        if !self.cap_advanced {
+            return None;
+        }
+        let capacitance = self.live_cap_uf * 1e-6;
         let esr = units::parse(&self.cap_esr_form, Unit::Ohm, 1.0).ok()?;
         let leakage = if self.cap_leakage_form.trim().is_empty() {
             None
@@ -2457,9 +2460,7 @@ impl LabApp {
         let Some(model) = CAPACITOR_MODELS.get(index) else {
             return;
         };
-        self.form[4] = format_component(
-            model.capacitance_f / FARAD_UNITS[self.component_units[LOAD_C_UNIT]].scale,
-        );
+        self.live_cap_uf = model.capacitance_f * 1e6;
         self.cap_esr_form = format_component(model.esr_ohm());
         self.cap_leakage_form = model
             .leakage_parallel_ohm
@@ -2467,7 +2468,7 @@ impl LabApp {
             .unwrap_or_default();
         self.capacitor_choice = Some(index);
         self.cap_advanced = true;
-        self.status = format!("Loaded capacitor preset: {}", model.name);
+        self.status = format!("Loaded plug C1 preset (Live): {}", model.name);
         self.status_error = false;
     }
 
@@ -2477,7 +2478,7 @@ impl LabApp {
         ui.horizontal(|ui| {
             ui.add_sized(
                 [158.0, 22.0],
-                egui::Label::new("Capacitor preset").halign(egui::Align::Min),
+                egui::Label::new("Plug C1 preset (Live)").halign(egui::Align::Min),
             );
             egui::ComboBox::from_id_salt("capacitor_model")
                 .selected_text(current.map_or("Custom / datasheet", |i| CAPACITOR_MODELS[i].name))
@@ -2492,7 +2493,7 @@ impl LabApp {
                 })
                 .response
                 .on_hover_text(
-                    "Sets C1, ESR and leakage. C2 still follows the C2 ratio under Advanced.",
+                    "Sets Live plug C1, ESR and leakage. Load parallel C and sweep limits stay unchanged.",
                 );
         });
         if choice != current
@@ -2509,9 +2510,11 @@ impl LabApp {
             );
         } else {
             ui.label(
-                RichText::new("Choose a typical part, or enter C1 and parasitics under Advanced.")
-                    .small()
-                    .color(MUTED),
+                RichText::new(
+                    "Choose a plug part for Live C1, or edit ESR and leakage under Advanced.",
+                )
+                .small()
+                .color(MUTED),
             );
         }
         ui.add_space(4.0);
@@ -3940,6 +3943,21 @@ impl LabApp {
     }
 
     fn reference_equations(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Experiments");
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.experiment_page, 0, "Energy return to mains");
+            ui.selectable_value(&mut self.experiment_page, 1, "Resonant tank");
+            ui.selectable_value(&mut self.experiment_page, 2, "Capacitor pulses");
+        });
+        ui.separator();
+        match self.experiment_page {
+            0 => self.mains_return_view(ui),
+            1 => self.tank_equations(ui),
+            _ => self.pulse_references(ui),
+        }
+    }
+
+    fn tank_equations(&mut self, ui: &mut egui::Ui) {
         ui.heading("Resonant tank · fundamental equivalent");
         ui.label("Enter tank components to combine them with the selected plug's operating-point admittance.");
         ui.horizontal_wrapped(|ui| {
@@ -4034,114 +4052,6 @@ impl LabApp {
         }
         ui.small("Estimates hold plug G/B fixed at the drive frequency. Weak-coupling uses an upper-bound capacitance proxy, not measured injected charge. Energy swing is not the same as net energy extracted per cycle. Neither predicts coupled tank stability.");
         ui.separator();
-        ui.heading("Single-pulse capacitor reference");
-        ui.horizontal(|ui| {
-            ui.label("Precharge voltage");
-            ui.add(egui::TextEdit::singleline(&mut self.pulse_v).desired_width(90.0));
-            ui.label("Pulse rate per capacitor");
-            ui.add(egui::TextEdit::singleline(&mut self.pulse_f).desired_width(90.0));
-        });
-        if let Some(point) = self.selected_result() {
-            let v = units::parse(&self.pulse_v, Unit::Volt, 1.0);
-            let f = units::parse(&self.pulse_f, Unit::Hertz, 1.0);
-            match v.and_then(|v| {
-                f.and_then(|f| analysis::pulse(point.metrics.capacitance_each_uf * 1e-6, v, f))
-            }) {
-                Ok(p) => {
-                    ui.label(format!("Energy per capacitor: {:.6} J   ·   ideal two-cap discharge power: {:.6} W",
-                    p.energy_per_capacitor_j, p.two_capacitor_max_power_w));
-                }
-                Err(e) => {
-                    ui.colored_label(ORANGE, e);
-                }
-            }
-        }
-        ui.small("Ideal full discharge into a resistor after external precharge. This is a separate reference estimate, not predicted plug output power.");
-        ui.separator();
-        ui.heading("Precharged plug · finite-cycle mains probe");
-        ui.small("Starts with externally charged C1/C2; runs without settling. Positive power = drawn from mains. Negative power = returned. This is not a steady-state sweep or an energy source.");
-        ui.small("Example finite discharge: 24 V RMS, 10 kHz, load R = 100 MΩ, load L = 3.4 mH, source Rs = 2 Ω, plug C1 = 10 µF, initial C1 = C2 = 100 V. Compare the first cycle's mains and port readings.");
-        ui.horizontal_wrapped(|ui| {
-            ui.label("C1 initial V (A−P)");
-            ui.add(egui::TextEdit::singleline(&mut self.discharge_c1_v).desired_width(70.0));
-            ui.label("C2 initial V (A−N)");
-            ui.add(egui::TextEdit::singleline(&mut self.discharge_c2_v).desired_width(70.0));
-            ui.label("Cycles (1–8)");
-            ui.add(egui::TextEdit::singleline(&mut self.discharge_cycles).desired_width(45.0));
-        });
-        if ui.button("Run precharged mains probe").clicked() {
-            let outcome = (|| {
-                let circuit = self.read_live_circuit()?;
-                let c1 = units::parse(&self.discharge_c1_v, Unit::Volt, 1.0)?;
-                let c2 = units::parse(&self.discharge_c2_v, Unit::Volt, 1.0)?;
-                let cycles = self
-                    .discharge_cycles
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| "Cycles must be a whole number from 1 to 8".to_owned())?;
-                diode_plug_lab::solver::precharged_discharge(
-                    circuit,
-                    self.live_cap_uf,
-                    c1,
-                    c2,
-                    cycles,
-                )
-            })();
-            match outcome {
-                Ok(result) => {
-                    self.precharged_result = Some(result);
-                    self.precharged_message =
-                        "Finite-cycle result; rerun after changing circuit inputs.".into();
-                }
-                Err(error) => {
-                    self.precharged_result = None;
-                    self.precharged_message = error;
-                }
-            }
-        }
-        ui.small(&self.precharged_message);
-        if let Some(result) = &self.precharged_result {
-            ui.label(format!(
-                "External initial stored energy: {:.6} J",
-                result.initial_energy_j
-            ));
-            for c in &result.cycles {
-                ui.label(format!("Cycle {}: mains {:+.4} W · plug port {:+.4} W · load {:.4} W · Δstored {:+.6} J · losses {:.4} W · gross mains return {:.6} J · balance error {:+.3e} J",
-                    c.number, c.source_active_power_w, c.port_active_power_w,
-                    c.load_active_power_w, c.energy_change_j, c.dissipation_w,
-                    c.returned_energy_j, c.balance_error_w));
-            }
-            ui.small("Source includes Rs; port is after Rs. A negative port cycle does not necessarily mean negative mains power. Balance error should be small versus transferred energy; refine/verify before interpreting a marginal sign.");
-            Plot::new("precharged_mains_power")
-                .height(190.0)
-                .legend(Legend::default())
-                .show(ui, |plot| {
-                    plot.line(
-                        Line::new(
-                            "Mains p(t) [W]",
-                            result
-                                .waveform
-                                .iter()
-                                .map(|w| [w.time_s * 1e3, w.input_power_w])
-                                .collect::<Vec<_>>(),
-                        )
-                        .color(TEAL),
-                    );
-                    plot.line(
-                        Line::new(
-                            "Plug port p(t) [W]",
-                            result
-                                .waveform
-                                .iter()
-                                .map(|w| [w.time_s * 1e3, w.port_power_w])
-                                .collect::<Vec<_>>(),
-                        )
-                        .color(ORANGE),
-                    );
-                });
-            ui.small("First source cycle, horizontal axis in ms. Negative instantaneous p(t) alone is not negative cycle-average active power.");
-        }
-        ui.separator();
         ui.heading("Tank ringdown probe (transient)");
         ui.horizontal(|ui| {
             ui.label("Start V");
@@ -4203,6 +4113,337 @@ impl LabApp {
             }
         }
         ui.label(&self.ring_message);
+    }
+
+    fn mains_probe_cap_uf(&self) -> Result<f64, String> {
+        if self.probe_use_selected_c1 {
+            self.selected_result()
+                .map(|point| point.metrics.capacitance_each_uf)
+                .ok_or_else(|| {
+                    "Select a successful sweep point for its C1 value, or use Live C1".into()
+                })
+        } else {
+            Ok(self.live_cap_uf)
+        }
+    }
+
+    fn load_mains_return_example(&mut self) {
+        // Only change editable inputs; never replace a saved sweep or its selection.
+        self.preset = None;
+        self.form[0] = "24".into();
+        self.form[1] = "10000".into();
+        self.form[2] = "100000000".into();
+        self.form[3] = "3.4".into();
+        self.component_units[LOAD_L_UNIT] = 1; // mH
+        self.form[4] = "0".into(); // no parallel load capacitance
+        self.form[5] = "2".into();
+        self.form[6] = "0.7".into();
+        self.form[7] = "1".into();
+        self.live_cap_uf = 10.0;
+        self.probe_use_selected_c1 = false;
+        self.cap_advanced = false;
+        self.cap_ratio_form = "1".into();
+        self.cap_esr_form = "0".into();
+        self.cap_leakage_form.clear();
+        self.diode_cap_form = "0".into();
+        self.diode_qrr_form = "0".into();
+        self.model_kind = 0;
+        self.return_enabled = false;
+        self.l_source_enabled = false;
+        self.gate_enabled = false;
+        self.discharge_c1_v = "100V".into();
+        self.discharge_c2_v = "100V".into();
+        self.discharge_cycles = "3".into();
+        self.precharged_result = None;
+        self.precharged_message =
+            "Example loaded; press Run probe. Saved sweeps are unchanged.".into();
+    }
+
+    fn run_mains_probe(&mut self) {
+        let outcome = (|| {
+            let circuit = self.read_live_circuit()?;
+            let cap_uf = self.mains_probe_cap_uf()?;
+            let c1 = units::parse(&self.discharge_c1_v, Unit::Volt, 1.0)?;
+            let c2 = units::parse(&self.discharge_c2_v, Unit::Volt, 1.0)?;
+            let cycles = self
+                .discharge_cycles
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "Cycles must be a whole number from 1 to 8".to_owned())?;
+            diode_plug_lab::solver::precharged_discharge(circuit, cap_uf, c1, c2, cycles)
+        })();
+        match outcome {
+            Ok(result) => {
+                self.precharged_result = Some(result);
+                self.precharged_message =
+                    "Finite-cycle result; rerun after changing circuit inputs.".into();
+            }
+            Err(error) => {
+                self.precharged_result = None;
+                self.precharged_message = error;
+            }
+        }
+    }
+
+    fn mains_return_view(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Can stored energy return to mains?");
+        ui.label("Precharge the plug capacitors externally, then measure signed power over 1–8 complete source cycles without settling.");
+        ui.small("Positive mains power = energy drawn. Negative = energy returned. A finite discharge is not sustained generation.");
+        ui.add_space(8.0);
+        ui.label(RichText::new("1  CHOOSE THE CIRCUIT").strong().color(TEAL));
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Load negative first-cycle example").clicked() {
+                self.load_mains_return_example();
+            }
+            ui.small("Changes editable inputs only; saved sweeps remain untouched.");
+        });
+        ui.small("Example: 24 V RMS / 10 kHz · load 100 MΩ + 3.4 mH · Rs 2 Ω · plug C1 10 µF. Not a 240 V / 50 Hz mains prediction.");
+        if let Ok(circuit) = self.read_live_circuit() {
+            ui.label(format!("Current sidebar circuit: {:.3} V RMS · {:.3} Hz · load R {:.3} Ω · L {:.4} H · Rs {:.3} Ω", circuit.voltage_rms, circuit.frequency, circuit.resistance, circuit.inductance, circuit.source_resistance));
+            if circuit.diode_recovery_charge_nc > 0.0 {
+                ui.colored_label(
+                    ORANGE,
+                    format!(
+                        "⚠ Diode Qrr = {} nC. This probe cannot account for Qrr yet.",
+                        format_component(circuit.diode_recovery_charge_nc)
+                    ),
+                );
+                if ui.button("Set Qrr to 0 for this probe").clicked() {
+                    self.cap_advanced = true;
+                    self.diode_qrr_form = "0".into();
+                    self.precharged_result = None;
+                    self.precharged_message =
+                        "Qrr set to 0 in the sidebar; rerun the probe.".into();
+                }
+            }
+            if circuit.source_inductance > 0.0
+                || circuit.ac_return.is_some()
+                || circuit.pulse_gate.is_some()
+                || circuit.load_model != LoadModel::Linear
+            {
+                ui.colored_label(ORANGE, "This probe requires a passive linear load, Ls off, load gate off and external AC return off. Change these in the sidebar or load the example.");
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(
+                &mut self.probe_use_selected_c1,
+                false,
+                format!(
+                    "Use Live plug C1: {} µF",
+                    format_component(self.live_cap_uf)
+                ),
+            );
+            let selected = self
+                .selected_result()
+                .map(|point| point.metrics.capacitance_each_uf);
+            ui.add_enabled_ui(selected.is_some(), |ui| {
+                ui.radio_value(
+                    &mut self.probe_use_selected_c1,
+                    true,
+                    format!(
+                        "Use selected sweep point C1: {} µF",
+                        selected.map_or("—".to_owned(), format_component)
+                    ),
+                );
+            });
+        });
+        if self.probe_use_selected_c1 && self.selected_result().is_none() {
+            ui.colored_label(
+                ORANGE,
+                "No successful sweep point selected; choose Live C1 instead.",
+            );
+        }
+        ui.small("The plug C1 preset sets Live C1 plus ESR/leakage. ‘Load parallel C’ is a separate load-branch capacitor; sweep limits do not set probe C1.");
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("2  SET INITIAL STORED ENERGY")
+                .strong()
+                .color(TEAL),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Plug C1 initial V (A−P)");
+            ui.add(egui::TextEdit::singleline(&mut self.discharge_c1_v).desired_width(70.0));
+            ui.label("Plug C2 initial V (A−N)");
+            ui.add(egui::TextEdit::singleline(&mut self.discharge_c2_v).desired_width(70.0));
+            ui.label("Cycles (1–8)");
+            ui.add(egui::TextEdit::singleline(&mut self.discharge_cycles).desired_width(45.0));
+        });
+        let initial = (|| {
+            let circuit = self.read_live_circuit()?;
+            let cap = self.mains_probe_cap_uf()? * 1e-6;
+            let c1 = units::parse(&self.discharge_c1_v, Unit::Volt, 1.0)?;
+            let c2 = units::parse(&self.discharge_c2_v, Unit::Volt, 1.0)?;
+            Ok::<_, String>(0.5 * cap * (c1 * c1 + circuit.capacitor_ratio * c2 * c2))
+        })();
+        if let Ok(energy) = initial {
+            ui.label(format!(
+                "Externally supplied initial plug-capacitor energy: {:.6} J",
+                energy
+            ));
+        }
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("3  RUN AND READ THE RESULT")
+                .strong()
+                .color(TEAL),
+        );
+        if ui.button("Run mains-return probe").clicked() {
+            self.run_mains_probe();
+        }
+        if !self.precharged_message.is_empty() {
+            ui.colored_label(
+                if self.precharged_result.is_some() {
+                    MUTED
+                } else {
+                    ORANGE
+                },
+                &self.precharged_message,
+            );
+        }
+        if let Some(result) = &self.precharged_result {
+            let first = &result.cycles[0];
+            ui.separator();
+            ui.label(RichText::new("FIRST COMPLETE SOURCE CYCLE · MAINS ACTIVE POWER").strong());
+            ui.label(
+                RichText::new(format!("{:+.4} W", first.source_active_power_w))
+                    .size(28.0)
+                    .strong()
+                    .color(if first.source_active_power_w < 0.0 {
+                        TEAL
+                    } else {
+                        ORANGE
+                    }),
+            );
+            ui.label(if first.source_active_power_w < 0.0 {
+                "Energy returned to the source during this cycle; check the stored-energy change and balance below."
+            } else {
+                "Net energy was drawn from the source during this cycle; negative instantaneous power can still occur."
+            });
+            ui.small(format!(
+                "This result used plug C1 = {:.4} µF · external initial stored energy = {:.6} J",
+                result.capacitance_each_uf, result.initial_energy_j
+            ));
+            ui.add_space(6.0);
+            egui::ScrollArea::horizontal()
+                .id_salt("mains_probe_table_scroll")
+                .show(ui, |ui| {
+                    egui::Grid::new("mains_probe_cycles")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for header in [
+                                "Cycle",
+                                "Mains W",
+                                "Plug port W",
+                                "Load W",
+                                "Δstored J",
+                                "Losses W",
+                                "Balance error J",
+                            ] {
+                                ui.strong(header);
+                            }
+                            ui.end_row();
+                            for c in &result.cycles {
+                                ui.label(c.number.to_string());
+                                ui.colored_label(
+                                    if c.source_active_power_w < 0.0 {
+                                        TEAL
+                                    } else {
+                                        ORANGE
+                                    },
+                                    format!("{:+.4}", c.source_active_power_w),
+                                );
+                                ui.label(format!("{:+.4}", c.port_active_power_w));
+                                ui.label(format!("{:.4}", c.load_active_power_w));
+                                ui.label(format!("{:+.6}", c.energy_change_j));
+                                ui.label(format!("{:.4}", c.dissipation_w));
+                                ui.label(format!("{:+.2e}", c.balance_error_w));
+                                ui.end_row();
+                            }
+                        });
+                });
+            ui.small(format!("First-cycle gross mains return (negative portions only): {:.6} J. This is not net export; use signed mains W above.", first.returned_energy_j));
+            ui.small("Source includes Rs; port is after Rs. A negative port cycle does not necessarily mean negative mains power. Balance error should be small versus transferred energy; refine/verify before interpreting a marginal sign.");
+            ui.label(RichText::new("FIRST-CYCLE WAVEFORMS").strong());
+            Plot::new("precharged_mains_power")
+                .height(190.0)
+                .legend(Legend::default())
+                .show(ui, |plot| {
+                    plot.line(
+                        Line::new(
+                            "Mains p(t) [W]",
+                            result
+                                .waveform
+                                .iter()
+                                .map(|w| [w.time_s * 1e3, w.input_power_w])
+                                .collect::<Vec<_>>(),
+                        )
+                        .color(TEAL),
+                    );
+                    plot.line(
+                        Line::new(
+                            "Plug port p(t) [W]",
+                            result
+                                .waveform
+                                .iter()
+                                .map(|w| [w.time_s * 1e3, w.port_power_w])
+                                .collect::<Vec<_>>(),
+                        )
+                        .color(ORANGE),
+                    );
+                });
+            ui.small("First source cycle, horizontal axis in ms. Negative instantaneous p(t) alone is not negative cycle-average active power.");
+            Plot::new("precharged_stored_energy")
+                .height(160.0)
+                .show(ui, |plot| {
+                    plot.line(
+                        Line::new(
+                            "Stored energy [J]",
+                            result
+                                .waveform
+                                .iter()
+                                .map(|w| {
+                                    [
+                                        w.time_s * 1e3,
+                                        w.capacitor_1_energy_j
+                                            + w.capacitor_2_energy_j
+                                            + w.load_capacitor_energy_j
+                                            + w.load_inductor_energy_j
+                                            + w.source_coil_energy_j,
+                                    ]
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .color(TEAL),
+                    );
+                });
+            ui.small("Total modeled stored energy, first cycle · time in ms. Changes in the model's loss-only ESR do not feed back into the voltages; use the balance error to judge numerical consistency.");
+        }
+    }
+
+    fn pulse_references(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Single-pulse capacitor reference");
+        ui.horizontal(|ui| {
+            ui.label("Precharge voltage");
+            ui.add(egui::TextEdit::singleline(&mut self.pulse_v).desired_width(90.0));
+            ui.label("Pulse rate per capacitor");
+            ui.add(egui::TextEdit::singleline(&mut self.pulse_f).desired_width(90.0));
+        });
+        if let Some(point) = self.selected_result() {
+            let v = units::parse(&self.pulse_v, Unit::Volt, 1.0);
+            let f = units::parse(&self.pulse_f, Unit::Hertz, 1.0);
+            match v.and_then(|v| {
+                f.and_then(|f| analysis::pulse(point.metrics.capacitance_each_uf * 1e-6, v, f))
+            }) {
+                Ok(p) => {
+                    ui.label(format!("Energy per capacitor: {:.6} J   ·   ideal two-cap discharge power: {:.6} W",
+                    p.energy_per_capacitor_j, p.two_capacitor_max_power_w));
+                }
+                Err(e) => {
+                    ui.colored_label(ORANGE, e);
+                }
+            }
+        }
+        ui.small("Ideal full discharge into a resistor after external precharge. This is a separate reference estimate, not predicted plug output power.");
         ui.separator();
         ui.heading("Single-pulse discharge reference");
         ui.checkbox(
@@ -5264,11 +5505,11 @@ impl LabApp {
                     self.tab_button(ui, 0, "Sweep");
                     self.tab_button(ui, 1, "Waveforms");
                     self.tab_button(ui, 2, "Energy");
-                    self.tab_button(ui, 3, "Tank");
+                    self.tab_button(ui, 3, "Experiments");
                     self.tab_button(ui, 4, "Branches");
                     self.tab_button(ui, 5, "Measure");
                     self.tab_button(ui, 6, "Docs");
-                    if self.tab != 6 && self.tab != 7 {
+                    if self.tab != 6 && self.tab != 7 && !(self.tab == 3 && self.experiment_page == 0) {
                         ui.separator();
                         self.point_selector(ui);
                     }
@@ -5299,7 +5540,7 @@ impl LabApp {
                             0
                         },
                         self.document,
-                        if self.tab == 0 { self.plot_generation } else { 0 },
+                        if self.tab == 0 { self.plot_generation } else if self.tab == 3 { self.experiment_page as u64 + 1 } else { 0 },
                     ))
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.tab {
@@ -7007,6 +7248,8 @@ mod ui_tests {
         let mut h = Harness::new();
         h.app.live.playing = false;
         h.app.cap_ratio_form = "0.5".into();
+        let original_load_c = h.app.read_live_circuit().unwrap().load_capacitance;
+        let original_sweep_limits = (h.app.form[8].clone(), h.app.form[9].clone());
         let index = CAPACITOR_MODELS
             .iter()
             .position(|model| model.name == "WIMA MKP 10 · 1 µF / 630 VDC")
@@ -7016,7 +7259,12 @@ mod ui_tests {
         assert_eq!(h.app.current_capacitor_model(), Some(index));
 
         let circuit = h.app.read_live_circuit().unwrap();
-        assert!((circuit.load_capacitance - 1e-6).abs() < 1e-15);
+        assert!((h.app.live_cap_uf - 1.0).abs() < 1e-12);
+        assert_eq!(circuit.load_capacitance, original_load_c);
+        assert_eq!(
+            (h.app.form[8].clone(), h.app.form[9].clone()),
+            original_sweep_limits
+        );
         assert!((circuit.capacitor_esr_ohm - 0.009_549_3).abs() < 1e-8);
         assert_eq!(circuit.capacitor_leakage_parallel_ohm, Some(3e10));
         assert_eq!(circuit.capacitor_ratio, 0.5);
@@ -7032,8 +7280,13 @@ mod ui_tests {
             );
         }
 
-        // Editing C1 switches the picker to Custom.
+        // Editing load C does not change the plug preset; editing Live C1 does.
         h.app.form[4] = "2.2".into();
+        assert_eq!(
+            h.app.current_capacitor_model(),
+            Some(CAPACITOR_MODELS.len() - 1)
+        );
+        h.app.live_cap_uf = 2.2;
         assert_eq!(h.app.current_capacitor_model(), None);
     }
 
@@ -7061,6 +7314,75 @@ mod ui_tests {
         assert!(result.cycles[0].source_active_power_w < 0.0);
         assert!(result.cycles[0].energy_change_j < 0.0);
         assert!(result.cycles[0].balance_error_w.abs() < 1e-5);
+    }
+
+    #[test]
+    fn experiment_example_is_runnable_and_preserves_saved_sweep() {
+        let mut h = Harness::new();
+        h.app.live.playing = false;
+        let selected = h.app.selected;
+        let saved = h.app.sweep.as_ref().map(|s| s.results.len());
+        let sweep_limits = (h.app.form[8].clone(), h.app.form[9].clone());
+        h.app.load_mains_return_example();
+        assert_eq!(h.app.selected, selected);
+        assert_eq!(h.app.sweep.as_ref().map(|s| s.results.len()), saved);
+        assert_eq!((h.app.form[8].clone(), h.app.form[9].clone()), sweep_limits);
+        assert!(!h.app.probe_use_selected_c1);
+        assert!((h.app.mains_probe_cap_uf().unwrap() - 10.0).abs() < 1e-12);
+        assert_eq!(
+            h.app.read_live_circuit().unwrap().diode_recovery_charge_nc,
+            0.0
+        );
+        h.app.run_mains_probe();
+        let result = h
+            .app
+            .precharged_result
+            .as_ref()
+            .expect(&h.app.precharged_message);
+        assert_eq!(result.cycles.len(), 3);
+        assert!(result.cycles[0].source_active_power_w < 0.0);
+        assert!(result.cycles[0].energy_change_j < 0.0);
+        h.app.probe_use_selected_c1 = true;
+        if h.app.selected_result().is_none() {
+            assert!(h.app.mains_probe_cap_uf().is_err());
+        }
+    }
+
+    #[test]
+    fn selected_diode_qrr_is_explained_before_mains_probe_runs() {
+        let mut h = Harness::new();
+        h.app.live.playing = false;
+        h.app.load_mains_return_example();
+        let index = DIODE_MODELS
+            .iter()
+            .position(|m| m.name == "MUR4100E")
+            .unwrap();
+        h.app.apply_diode_model(index);
+        h.app.run_mains_probe();
+        assert!(h.app.precharged_result.is_none());
+        assert!(h.app.precharged_message.contains("Qrr"));
+        h.app.diode_qrr_form = "0".into();
+        h.app.run_mains_probe();
+        assert!(
+            h.app.precharged_result.is_some(),
+            "{}",
+            h.app.precharged_message
+        );
+    }
+
+    #[test]
+    fn experiments_render_all_pages_on_compact_window() {
+        let mut h = Harness::new();
+        h.app.live.playing = false;
+        h.app.tab = 3;
+        h.app.load_mains_return_example();
+        h.app.run_mains_probe();
+        for page in 0..3 {
+            h.app.experiment_page = page;
+            h.pass([1000.0, 680.0], None);
+            h.pass([1000.0, 680.0], None);
+            assert!(h.app.probe.analysis_viewport.is_some());
+        }
     }
 
     #[test]
