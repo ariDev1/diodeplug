@@ -6,6 +6,29 @@ pub struct Preset {
     pub name: &'static str,
     pub note: &'static str,
     pub config: Config,
+    /// A nominal nameplate rating, not a constant-power or thermal load model.
+    pub rated_load: Option<LoadRating>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LoadRating {
+    pub voltage_rms_v: f64,
+    pub power_w: f64,
+}
+
+fn lamp_rating(name: &str) -> Option<LoadRating> {
+    let (voltage_rms_v, power_w) = match name {
+        "240 V / 20 W incandescent" => (240.0, 20.0),
+        "230 V / 60 W incandescent" => (230.0, 60.0),
+        "120 V / 60 W incandescent" => (120.0, 60.0),
+        "12 V / 5 W vehicle bulb" => (12.0, 5.0),
+        "24 V / 10 W panel lamp" => (24.0, 10.0),
+        _ => return None,
+    };
+    Some(LoadRating {
+        voltage_rms_v,
+        power_w,
+    })
 }
 
 fn base(
@@ -53,10 +76,17 @@ fn base(
 /// Nominal component examples, not measured device characterization.
 pub fn all() -> Vec<Preset> {
     let mut list = Vec::new();
-    let mut add = |name, note, config| list.push(Preset { name, note, config });
+    let mut add = |name, note, config| {
+        list.push(Preset {
+            name,
+            note,
+            config,
+            rated_load: lamp_rating(name),
+        })
+    };
     add(
         "240 V / 20 W incandescent",
-        "Hot-filament R = 240²/20 = 2880 Ω. The plug's P–N voltage is not necessarily 240 V: check calculated load power. No cold inrush/heating.",
+        "20 W is the rating at 240 V ACROSS the lamp (hot R = 2880 Ω), not a power limit. Higher plug voltage can greatly exceed its rating; fixed-R results are not a real lamp or safety prediction.",
         base(240.0, 50.0, 2880.0, 0.0, 0.0, 0.47, 47.0),
     );
     add(

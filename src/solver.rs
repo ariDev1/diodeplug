@@ -975,6 +975,8 @@ impl Transient {
 #[derive(Clone, Debug)]
 pub struct DischargeCycle {
     pub number: usize,
+    pub load_voltage_rms_v: f64,
+    pub load_resistor_power_w: f64,
     pub source_active_power_w: f64,
     pub port_active_power_w: f64,
     pub load_active_power_w: f64,
@@ -995,6 +997,7 @@ pub struct DischargeCycle {
 
 #[derive(Clone, Debug)]
 pub struct PrechargedDischarge {
+    pub frequency_hz: f64,
     pub capacitance_each_uf: f64,
     pub diode_junction_capacitance_f: f64,
     pub has_powered_return: bool,
@@ -1062,6 +1065,8 @@ pub fn precharged_discharge(
         let mut source_j = 0.0;
         let mut port_j = 0.0;
         let mut load_j = 0.0;
+        let mut resistor_j = 0.0;
+        let mut load_voltage_sq_s = 0.0;
         let mut loss_j = 0.0;
         let mut esr_j = 0.0;
         let mut ac_return_j = 0.0;
@@ -1076,6 +1081,10 @@ pub fn precharged_discharge(
                 circuit.resistance * branch(w).powi(2) + circuit.load_model.threshold() * branch(w)
             };
             load_j += dt * (load_power(&pair[0]) + load_power(&pair[1])) / 2.0;
+            resistor_j +=
+                dt * circuit.resistance * (branch(&pair[0]).powi(2) + branch(&pair[1]).powi(2))
+                    / 2.0;
+            load_voltage_sq_s += dt * (pair[0].load_v.powi(2) + pair[1].load_v.powi(2)) / 2.0;
             ac_return_j += dt * (pair[0].return_path_power_w + pair[1].return_path_power_w) / 2.0;
             bus_j +=
                 dt * circuit.load_model.threshold() * (branch(&pair[0]) + branch(&pair[1])) / 2.0;
@@ -1111,6 +1120,8 @@ pub fn precharged_discharge(
             source_j,
             port_j,
             load_j,
+            resistor_j,
+            load_voltage_sq_s,
             loss_j,
             esr_j,
             ac_return_j,
@@ -1126,6 +1137,8 @@ pub fn precharged_discharge(
         }
         summaries.push(DischargeCycle {
             number,
+            load_voltage_rms_v: (load_voltage_sq_s / period).max(0.0).sqrt(),
+            load_resistor_power_w: resistor_j / period,
             source_active_power_w: source_j / period,
             port_active_power_w: port_j / period,
             load_active_power_w: load_j / period,
@@ -1143,6 +1156,7 @@ pub fn precharged_discharge(
         }
     }
     Ok(PrechargedDischarge {
+        frequency_hz: circuit.frequency,
         capacitance_each_uf: cap_uf,
         diode_junction_capacitance_f: if circuit.source_inductance > 0.0 {
             circuit.diode_capacitance_f
@@ -2041,6 +2055,40 @@ mod tests {
             let result = precharged_discharge(c, 10.0, 20.0, 20.0, 1).unwrap();
             assert!(result.cycles[0].source_active_power_w.is_finite());
             assert!(result.cycles[0].quality_pass, "{:?}", result.cycles[0]);
+        }
+    }
+
+    #[test]
+    fn rated_20w_lamp_fixture_can_draw_more_when_plug_voltage_is_higher() {
+        let mut c = circuit();
+        c.voltage_rms = 240.0;
+        c.frequency = 50.0;
+        c.resistance = 2880.0; // 20 W at 240 V RMS ACROSS the hot-filament resistor
+        c.inductance = 0.0;
+        c.source_resistance = 1.0;
+        c.diode_drop = 1.0;
+        c.diode_resistance = 0.1;
+        c.capacitor_esr_ohm = 0.002 / (std::f64::consts::TAU * 50.0 * 10e-6);
+        c.capacitor_leakage_parallel_ohm = Some(3e9);
+        c.diode_recovery_charge_nc = 100.0;
+        let result = precharged_discharge(c.clone(), 10.0, 100.0, 100.0, 3).unwrap();
+        let first = &result.cycles[0];
+        let last = result.cycles.last().unwrap();
+        assert!((first.source_active_power_w - 69.04).abs() < 0.1);
+        assert!((first.load_active_power_w - 49.33).abs() < 0.1);
+        assert!((last.load_voltage_rms_v - 454.3).abs() < 0.5);
+        assert!(first.quality_pass && last.quality_pass);
+        assert!(first.source_active_power_w > first.load_active_power_w);
+        assert!(first.energy_change_j > 0.0); // mains is charging, not receiving stored energy
+        assert!(first.load_voltage_rms_v > 240.0);
+        assert!(last.load_voltage_rms_v > first.load_voltage_rms_v);
+        assert!(last.load_resistor_power_w > 60.0);
+        for cycle in &result.cycles {
+            assert!(
+                (cycle.load_resistor_power_w - cycle.load_voltage_rms_v.powi(2) / c.resistance)
+                    .abs()
+                    < 0.01
+            );
         }
     }
     #[test]

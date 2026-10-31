@@ -800,6 +800,7 @@ struct LabApp {
     experiment_page: usize,
     probe_use_selected_c1: bool,
     precharged_result: Option<diode_plug_lab::solver::PrechargedDischarge>,
+    precharged_rating: Option<presets::LoadRating>,
     precharged_message: String,
     discharge_result: Option<diode_plug_lab::analysis::DischargeResult>,
     discharge_message: String,
@@ -1180,12 +1181,13 @@ impl LabApp {
             ring_clamps_disabled: true,
             ring_result: None,
             ring_message: "Set tank L, C and loss G on this tab, then run a ringdown probe.".into(),
-            discharge_c1_v: "100V".into(),
-            discharge_c2_v: "100V".into(),
+            discharge_c1_v: "0V".into(),
+            discharge_c2_v: "0V".into(),
             discharge_cycles: "3".into(),
             experiment_page: 0,
             probe_use_selected_c1: false,
             precharged_result: None,
+            precharged_rating: None,
             precharged_message: String::new(),
             discharge_result: None,
             discharge_message:
@@ -1350,12 +1352,13 @@ impl LabApp {
         self.ring_start_v = "10V".into();
         self.ring_cycles = "20".into();
         self.ring_clamps_disabled = true;
-        self.discharge_c1_v = "100V".into();
-        self.discharge_c2_v = "100V".into();
+        self.discharge_c1_v = "0V".into();
+        self.discharge_c2_v = "0V".into();
         self.discharge_cycles = "3".into();
         self.experiment_page = 0;
         self.probe_use_selected_c1 = false;
         self.precharged_result = None;
+        self.precharged_rating = None;
         self.precharged_message.clear();
         self.discharge_single_cap = true;
         self.observed_enabled = false;
@@ -3022,6 +3025,13 @@ impl LabApp {
                 m.input_admittance_real_s, m.plug_only_admittance_real_s, m.fundamental_active_power_w,
                 m.equivalent_parallel_resistance_ohm.map_or("undefined".into(), |r| format!("{r:.4} Ω"))))
                 .color(if m.input_admittance_real_s < 0.0 { ORANGE } else { TEAL }));
+            if let Some(rating) = Self::lamp_rating_for_preset(
+                sweep.config.preset_name.as_deref(),
+                &sweep.effective_circuit,
+            ) && m.load_voltage_rms_v > rating.voltage_rms_v * 1.05
+            {
+                ui.colored_label(ORANGE, format!("⚠ LAMP NAMEPLATE EXCEEDED: rated {:.0} W at {:.0} V RMS across the lamp; model predicts {:.1} V RMS and {:.1} W at this sweep point. Fixed hot resistance only, not a safe or realistic overvoltage lamp model.", rating.power_w, rating.voltage_rms_v, m.load_voltage_rms_v, m.load_power_w));
+            }
         }
         if let (Some(observed), Some(comparison)) =
             (&sweep.config.observed_ac, &sweep.observation_comparison)
@@ -3945,7 +3955,7 @@ impl LabApp {
     fn reference_equations(&mut self, ui: &mut egui::Ui) {
         ui.heading("Experiments");
         ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.experiment_page, 0, "Energy return to mains");
+            ui.selectable_value(&mut self.experiment_page, 0, "Power flow / precharge");
             ui.selectable_value(&mut self.experiment_page, 1, "Resonant tank");
             ui.selectable_value(&mut self.experiment_page, 2, "Capacitor pulses");
         });
@@ -4127,6 +4137,29 @@ impl LabApp {
         }
     }
 
+    /// A nameplate rating applies only while the chosen fixture still uses
+    /// its nominal hot resistance; it is not a constant-power load model.
+    fn current_lamp_rating(&self, circuit: &Circuit) -> Option<presets::LoadRating> {
+        let presets = presets::all();
+        let preset = presets.get(self.preset?)?;
+        Self::lamp_rating_for_preset(Some(preset.name), circuit)
+    }
+
+    fn lamp_rating_for_preset(
+        preset_name: Option<&str>,
+        circuit: &Circuit,
+    ) -> Option<presets::LoadRating> {
+        let rating = presets::all()
+            .into_iter()
+            .find(|preset| Some(preset.name) == preset_name)?
+            .rated_load?;
+        let nominal_r = rating.voltage_rms_v.powi(2) / rating.power_w;
+        (circuit.load_model == LoadModel::Linear
+            && circuit.inductance == 0.0
+            && ((circuit.resistance - nominal_r) / nominal_r).abs() < 1e-6)
+            .then_some(rating)
+    }
+
     fn load_mains_return_example(&mut self) {
         // Only change editable inputs; never replace a saved sweep or its selection.
         self.preset = None;
@@ -4155,6 +4188,7 @@ impl LabApp {
         self.discharge_c2_v = "100V".into();
         self.discharge_cycles = "3".into();
         self.precharged_result = None;
+        self.precharged_rating = None;
         self.precharged_message =
             "Example loaded; press Run probe. Saved sweeps are unchanged.".into();
     }
@@ -4162,6 +4196,7 @@ impl LabApp {
     fn run_mains_probe(&mut self) {
         let outcome = (|| {
             let circuit = self.read_live_circuit()?;
+            let rating = self.current_lamp_rating(&circuit);
             let cap_uf = self.mains_probe_cap_uf()?;
             let c1 = units::parse(&self.discharge_c1_v, Unit::Volt, 1.0)?;
             let c2 = units::parse(&self.discharge_c2_v, Unit::Volt, 1.0)?;
@@ -4171,43 +4206,37 @@ impl LabApp {
                 .parse::<usize>()
                 .map_err(|_| "Cycles must be a whole number from 1 to 8".to_owned())?;
             diode_plug_lab::solver::precharged_discharge(circuit, cap_uf, c1, c2, cycles)
+                .map(|result| (result, rating))
         })();
         match outcome {
-            Ok(result) => {
+            Ok((result, rating)) => {
                 self.precharged_result = Some(result);
+                self.precharged_rating = rating;
                 self.precharged_message =
                     "Finite-cycle result; rerun after changing circuit inputs.".into();
             }
             Err(error) => {
                 self.precharged_result = None;
+                self.precharged_rating = None;
                 self.precharged_message = error;
             }
         }
     }
 
     fn mains_return_view(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Can stored energy return to mains?");
-        ui.label("Precharge the plug capacitors externally, then measure signed power over 1–8 complete source cycles without settling.");
-        ui.small("Positive mains power = energy drawn. Negative = energy returned. A finite discharge is not sustained generation.");
+        ui.heading("Power flow · startup / precharge experiment");
+        ui.label("Compare power drawn at the source with power at the load and energy stored in the capacitors over complete AC cycles.");
+        ui.small("This is a transient from your chosen initial capacitor voltages, not a steady-state wattage prediction. Negative source power means net return for that cycle only.");
         ui.add_space(8.0);
-        ui.label(RichText::new("1  CHOOSE THE CIRCUIT").strong().color(TEAL));
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Load negative first-cycle example").clicked() {
-                self.load_mains_return_example();
-            }
-            ui.small("Changes editable inputs only; saved sweeps remain untouched.");
-        });
-        ui.small("Example: 24 V RMS / 10 kHz · load 100 MΩ + 3.4 mH · Rs 2 Ω · plug C1 10 µF. Not a 240 V / 50 Hz mains prediction.");
+        ui.label(
+            RichText::new("1  CURRENT CIRCUIT (SIDEBAR)")
+                .strong()
+                .color(TEAL),
+        );
         if let Ok(circuit) = self.read_live_circuit() {
             ui.label(format!("Current sidebar circuit: {:.3} V RMS · {:.3} Hz · load R {:.3} Ω · L {:.4} H · Rs {:.3} Ω", circuit.voltage_rms, circuit.frequency, circuit.resistance, circuit.inductance, circuit.source_resistance));
-            if circuit.diode_recovery_charge_nc > 0.0 {
-                ui.colored_label(
-                    ORANGE,
-                    format!(
-                        "Model note: Qrr = {} nC is not applied to transient states or this energy ledger; the probe still runs with your selected diode.",
-                        format_component(circuit.diode_recovery_charge_nc)
-                    ),
-                );
+            if let Some(rating) = self.current_lamp_rating(&circuit) {
+                ui.colored_label(ORANGE, format!("Lamp nameplate: {:.0} W ONLY at {:.0} V RMS across the lamp. This preset uses a fixed hot resistance of {:.1} Ω, not a {:.0} W power limiter or a thermal lamp model.", rating.power_w, rating.voltage_rms_v, circuit.resistance, rating.power_w));
             }
             if circuit.ac_return.is_some()
                 || matches!(circuit.load_model, LoadModel::BidirectionalBus { .. })
@@ -4249,11 +4278,18 @@ impl LabApp {
         }
         ui.small("The plug C1 preset sets Live C1 plus ESR/leakage. ‘Load parallel C’ is a separate load-branch capacitor; sweep limits do not set probe C1.");
         ui.add_space(8.0);
+        ui.collapsing("Optional: load a separate negative-power example", |ui| {
+            ui.small("This changes the editable circuit to 24 V / 10 kHz with a nearly open load; it is NOT a 240 V / 50 Hz lamp prediction. Saved sweeps remain untouched.");
+            if ui.button("Load example (then run)").clicked() {
+                self.load_mains_return_example();
+            }
+        });
         ui.label(
-            RichText::new("2  SET INITIAL STORED ENERGY")
+            RichText::new("2  INITIAL CAPACITOR VOLTAGES")
                 .strong()
                 .color(TEAL),
         );
+        ui.small("With passive loads and no powered return, 0 V starts uncharged and the mains charges the capacitors. A larger precharge may return energy supplied before this run.");
         ui.horizontal_wrapped(|ui| {
             ui.label("Plug C1 initial V (A−P)");
             ui.add(egui::TextEdit::singleline(&mut self.discharge_c1_v).desired_width(70.0));
@@ -4282,11 +4318,11 @@ impl LabApp {
         }
         ui.add_space(8.0);
         ui.label(
-            RichText::new("3  RUN AND READ THE RESULT")
+            RichText::new("3  CALCULATE CYCLE-BY-CYCLE POWER")
                 .strong()
                 .color(TEAL),
         );
-        if ui.button("Run mains-return probe").clicked() {
+        if ui.button("Calculate power flow").clicked() {
             self.run_mains_probe();
         }
         if !self.precharged_message.is_empty() {
@@ -4301,8 +4337,31 @@ impl LabApp {
         }
         if let Some(result) = &self.precharged_result {
             let first = &result.cycles[0];
+            let period = 1.0 / result.frequency_hz;
             ui.separator();
-            ui.label(RichText::new("FIRST COMPLETE SOURCE CYCLE · MAINS ACTIVE POWER").strong());
+            if let Some(rating) = self.precharged_rating {
+                let last = result.cycles.last().unwrap();
+                ui.colored_label(
+                    ORANGE,
+                    RichText::new(format!(
+                        "{:.0} W LAMP IS A NAMEPLATE RATING, NOT A {:.0} W POWER LIMIT",
+                        rating.power_w, rating.power_w
+                    ))
+                    .strong(),
+                );
+                ui.label(format!("At its rated {:.0} V RMS, the hot-filament resistor is {:.1} Ω and draws {:.0} W. In cycle 1 the simulated load sees {:.1} V RMS and its fixed-R branch draws {:.1} W; by cycle {} it sees {:.1} V RMS and draws {:.1} W.",
+                    rating.voltage_rms_v, rating.voltage_rms_v.powi(2) / rating.power_w, rating.power_w,
+                    first.load_voltage_rms_v, first.load_resistor_power_w,
+                    last.number, last.load_voltage_rms_v, last.load_resistor_power_w));
+                if result
+                    .cycles
+                    .iter()
+                    .any(|c| c.load_voltage_rms_v > rating.voltage_rms_v * 1.05)
+                {
+                    ui.colored_label(ORANGE, "OVER NAMEPLATE VOLTAGE: this resistor-only model cannot predict real filament heating, resistance change, failure or safe continuous operation. Do not treat its watts as a validated lamp prediction.");
+                }
+            }
+            ui.label(RichText::new("CYCLE 1 · SOURCE INPUT (NOT LAMP POWER)").strong());
             ui.label(
                 RichText::new(format!(
                     "{:+.4} W{}",
@@ -4330,11 +4389,52 @@ impl LabApp {
             } else {
                 "Net energy was drawn from the source during this cycle; negative instantaneous power can still occur."
             });
+            if period > 0.0 && first.quality_pass {
+                ui.label(format!("Cycle 1 ledger: source {:+.2} W = load {:+.2} W + storage change {:+.2} W + physical losses {:.2} W + AC return path {:+.2} W + balance residual {:+.2} W.",
+                    first.source_active_power_w, first.load_active_power_w,
+                    first.energy_change_j / period, first.dissipation_w, first.ac_return_power_w, first.balance_error_w / period));
+                if first.energy_change_j > 0.0 {
+                    ui.small("Stored energy increased: the source is charging the capacitors, not being powered by them.");
+                }
+            }
+            if first.declared_esr_loss_w > 0.0 || result.qrr_not_modeled_nc > 0.0 {
+                ui.small("Model limit: capacitor ESR is a separate loss estimate, not fed back into this power ledger; diode Qrr is not included in the transient. Do not treat these watts as hardware validation.");
+            }
             ui.small(format!(
-                "This result used plug C1 = {:.4} µF · external initial stored energy = {:.6} J",
+                "This run used plug C1 = {:.4} µF · initial modeled stored energy = {:.6} J",
                 result.capacitance_each_uf, result.initial_energy_j
             ));
             ui.add_space(6.0);
+            ui.label(RichText::new("COMPLETE-CYCLE COMPARISON · NOT STEADY STATE").strong());
+            egui::Grid::new("power_flow_simple_cycles")
+                .striped(true)
+                .show(ui, |ui| {
+                    for header in [
+                        "Cycle",
+                        "Source W",
+                        "Load W",
+                        "Load V RMS",
+                        "Storage Δ J",
+                        "Check",
+                    ] {
+                        ui.strong(header);
+                    }
+                    ui.end_row();
+                    for c in &result.cycles {
+                        ui.label(c.number.to_string());
+                        ui.label(format!("{:+.2}", c.source_active_power_w));
+                        ui.label(format!("{:.2}", c.load_active_power_w));
+                        ui.label(format!("{:.1}", c.load_voltage_rms_v));
+                        ui.label(format!("{:+.4}", c.energy_change_j));
+                        ui.colored_label(
+                            if c.quality_pass { TEAL } else { ORANGE },
+                            if c.quality_pass { "OK" } else { "CHECK" },
+                        );
+                        ui.end_row();
+                    }
+                });
+            ui.small("Source W is mains input; Load W is modeled power into the load branch. Storage Δ J > 0 means charging. Cycle 3 is not necessarily settled.");
+            ui.collapsing("Technical details · losses, external power and waveforms", |ui| {
             egui::ScrollArea::horizontal()
                 .id_salt("mains_probe_table_scroll")
                 .show(ui, |ui| {
@@ -4446,6 +4546,7 @@ impl LabApp {
                     );
                 });
             ui.small("Total modeled stored energy, first cycle · time in ms. Declared ESR and Qrr do not feed back into transient voltages; see the separate terms and balance error.");
+            });
         }
     }
 
@@ -5261,7 +5362,29 @@ impl LabApp {
             });
         });
         ui.add_space(3.0);
-        let (source, range) = if self.tab == 7 {
+        let (source, range) = if self.tab == 3 && self.experiment_page == 0 {
+            (
+                self.read_live_circuit()
+                    .map_or("Check current sidebar inputs".into(), |c| {
+                        format!(
+                            "{:.3} V RMS   ·   {:.3} Hz (editable)",
+                            c.voltage_rms, c.frequency
+                        )
+                    }),
+                self.mains_probe_cap_uf()
+                    .map_or("Choose a plug C1".into(), |c| {
+                        format!(
+                            "Plug C1 {:.4} µF  ·  {}",
+                            c,
+                            if self.probe_use_selected_c1 {
+                                "selected sweep point"
+                            } else {
+                                "Live / preset"
+                            }
+                        )
+                    }),
+            )
+        } else if self.tab == 7 {
             (
                 self.read_live_circuit()
                     .map_or("Edit circuit inputs at left".into(), |c| {
@@ -5287,7 +5410,23 @@ impl LabApp {
                 "Run a sweep to analyze C1".into(),
             )
         };
-        let selected = if self.tab == 7 {
+        let selected = if self.tab == 3 && self.experiment_page == 0 {
+            self.precharged_result.as_ref().map_or(
+                "Run power flow to compare source and load".into(),
+                |r| {
+                    format!(
+                        "Last run, cycle 1: mains {:+.2} W · load {:.2} W{}",
+                        r.cycles[0].source_active_power_w,
+                        r.cycles[0].load_active_power_w,
+                        if r.cycles[0].quality_pass {
+                            ""
+                        } else {
+                            " · CHECK"
+                        }
+                    )
+                },
+            )
+        } else if self.tab == 7 {
             self.live
                 .samples
                 .last()
@@ -5325,6 +5464,8 @@ impl LabApp {
             (
                 if self.tab == 7 {
                     "LIVE CAPACITANCE"
+                } else if self.tab == 3 && self.experiment_page == 0 {
+                    "PROBE CAPACITANCE"
                 } else {
                     "CAPACITANCE SWEEP"
                 },
@@ -5333,6 +5474,8 @@ impl LabApp {
             (
                 if self.tab == 7 {
                     "LIVE STATE"
+                } else if self.tab == 3 && self.experiment_page == 0 {
+                    "CYCLE 1 · SOURCE / LOAD"
                 } else {
                     "SELECTED LOAD"
                 },
@@ -7432,6 +7575,40 @@ mod ui_tests {
         assert_eq!(after.capacitor_esr_ohm, before.capacitor_esr_ohm);
         assert_eq!(h.app.current_capacitor_model(), Some(cap));
         assert_eq!(h.app.current_diode_model(), Some(diode));
+    }
+
+    #[test]
+    fn lamp_nameplate_is_only_shown_for_its_unchanged_hot_resistor() {
+        let mut h = Harness::new();
+        let lamp = presets::all()
+            .iter()
+            .position(|p| p.name == "240 V / 20 W incandescent")
+            .unwrap();
+        h.app.apply_preset(lamp);
+        let rating = h
+            .app
+            .current_lamp_rating(&h.app.read_live_circuit().unwrap())
+            .unwrap();
+        assert_eq!(rating.power_w, 20.0);
+        assert_eq!(rating.voltage_rms_v, 240.0);
+        h.app.form[2] = "1000".into();
+        assert!(
+            h.app
+                .current_lamp_rating(&h.app.read_live_circuit().unwrap())
+                .is_none()
+        );
+        let saved_circuit = presets::all()[lamp].config.circuit.clone();
+        h.app.apply_preset(0);
+        assert_eq!(
+            LabApp::lamp_rating_for_preset(Some("240 V / 20 W incandescent"), &saved_circuit)
+                .unwrap()
+                .power_w,
+            20.0
+        );
+        assert!(
+            LabApp::lamp_rating_for_preset(Some("120 V / 60 W incandescent"), &saved_circuit)
+                .is_none()
+        );
     }
 
     #[test]
