@@ -794,6 +794,11 @@ struct LabApp {
     ring_clamps_disabled: bool,
     ring_result: Option<RingdownResult>,
     ring_message: String,
+    discharge_c1_v: String,
+    discharge_c2_v: String,
+    discharge_cycles: String,
+    precharged_result: Option<diode_plug_lab::solver::PrechargedDischarge>,
+    precharged_message: String,
     discharge_result: Option<diode_plug_lab::analysis::DischargeResult>,
     discharge_message: String,
     discharge_single_cap: bool,
@@ -1173,6 +1178,11 @@ impl LabApp {
             ring_clamps_disabled: true,
             ring_result: None,
             ring_message: "Set tank L, C and loss G on this tab, then run a ringdown probe.".into(),
+            discharge_c1_v: "100V".into(),
+            discharge_c2_v: "100V".into(),
+            discharge_cycles: "3".into(),
+            precharged_result: None,
+            precharged_message: String::new(),
             discharge_result: None,
             discharge_message:
                 "Select a sweep point, then choose an isolated single- or two-capacitor discharge."
@@ -1336,6 +1346,11 @@ impl LabApp {
         self.ring_start_v = "10V".into();
         self.ring_cycles = "20".into();
         self.ring_clamps_disabled = true;
+        self.discharge_c1_v = "100V".into();
+        self.discharge_c2_v = "100V".into();
+        self.discharge_cycles = "3".into();
+        self.precharged_result = None;
+        self.precharged_message.clear();
         self.discharge_single_cap = true;
         self.observed_enabled = false;
         self.observed_location = Location::Source;
@@ -4042,6 +4057,90 @@ impl LabApp {
             }
         }
         ui.small("Ideal full discharge into a resistor after external precharge. This is a separate reference estimate, not predicted plug output power.");
+        ui.separator();
+        ui.heading("Precharged plug · finite-cycle mains probe");
+        ui.small("Starts with externally charged C1/C2; runs without settling. Positive power = drawn from mains. Negative power = returned. This is not a steady-state sweep or an energy source.");
+        ui.small("Example finite discharge: 24 V RMS, 10 kHz, load R = 100 MΩ, load L = 3.4 mH, source Rs = 2 Ω, plug C1 = 10 µF, initial C1 = C2 = 100 V. Compare the first cycle's mains and port readings.");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("C1 initial V (A−P)");
+            ui.add(egui::TextEdit::singleline(&mut self.discharge_c1_v).desired_width(70.0));
+            ui.label("C2 initial V (A−N)");
+            ui.add(egui::TextEdit::singleline(&mut self.discharge_c2_v).desired_width(70.0));
+            ui.label("Cycles (1–8)");
+            ui.add(egui::TextEdit::singleline(&mut self.discharge_cycles).desired_width(45.0));
+        });
+        if ui.button("Run precharged mains probe").clicked() {
+            let outcome = (|| {
+                let circuit = self.read_live_circuit()?;
+                let c1 = units::parse(&self.discharge_c1_v, Unit::Volt, 1.0)?;
+                let c2 = units::parse(&self.discharge_c2_v, Unit::Volt, 1.0)?;
+                let cycles = self
+                    .discharge_cycles
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| "Cycles must be a whole number from 1 to 8".to_owned())?;
+                diode_plug_lab::solver::precharged_discharge(
+                    circuit,
+                    self.live_cap_uf,
+                    c1,
+                    c2,
+                    cycles,
+                )
+            })();
+            match outcome {
+                Ok(result) => {
+                    self.precharged_result = Some(result);
+                    self.precharged_message =
+                        "Finite-cycle result; rerun after changing circuit inputs.".into();
+                }
+                Err(error) => {
+                    self.precharged_result = None;
+                    self.precharged_message = error;
+                }
+            }
+        }
+        ui.small(&self.precharged_message);
+        if let Some(result) = &self.precharged_result {
+            ui.label(format!(
+                "External initial stored energy: {:.6} J",
+                result.initial_energy_j
+            ));
+            for c in &result.cycles {
+                ui.label(format!("Cycle {}: mains {:+.4} W · plug port {:+.4} W · load {:.4} W · Δstored {:+.6} J · losses {:.4} W · gross mains return {:.6} J · balance error {:+.3e} J",
+                    c.number, c.source_active_power_w, c.port_active_power_w,
+                    c.load_active_power_w, c.energy_change_j, c.dissipation_w,
+                    c.returned_energy_j, c.balance_error_w));
+            }
+            ui.small("Source includes Rs; port is after Rs. A negative port cycle does not necessarily mean negative mains power. Balance error should be small versus transferred energy; refine/verify before interpreting a marginal sign.");
+            Plot::new("precharged_mains_power")
+                .height(190.0)
+                .legend(Legend::default())
+                .show(ui, |plot| {
+                    plot.line(
+                        Line::new(
+                            "Mains p(t) [W]",
+                            result
+                                .waveform
+                                .iter()
+                                .map(|w| [w.time_s * 1e3, w.input_power_w])
+                                .collect::<Vec<_>>(),
+                        )
+                        .color(TEAL),
+                    );
+                    plot.line(
+                        Line::new(
+                            "Plug port p(t) [W]",
+                            result
+                                .waveform
+                                .iter()
+                                .map(|w| [w.time_s * 1e3, w.port_power_w])
+                                .collect::<Vec<_>>(),
+                        )
+                        .color(ORANGE),
+                    );
+                });
+            ui.small("First source cycle, horizontal axis in ms. Negative instantaneous p(t) alone is not negative cycle-average active power.");
+        }
         ui.separator();
         ui.heading("Tank ringdown probe (transient)");
         ui.horizontal(|ui| {
@@ -6936,6 +7035,32 @@ mod ui_tests {
         // Editing C1 switches the picker to Custom.
         h.app.form[4] = "2.2".into();
         assert_eq!(h.app.current_capacitor_model(), None);
+    }
+
+    #[test]
+    fn precharged_probe_uses_current_sidebar_circuit_not_saved_sweep() {
+        let mut h = Harness::new();
+        h.app.live.playing = false;
+        h.app.form[0] = "24".into();
+        h.app.form[1] = "10000".into();
+        h.app.form[2] = "100000000".into();
+        h.app.form[3] = "3.4".into();
+        h.app.form[4] = "0".into();
+        h.app.form[5] = "2".into();
+        h.app.live_cap_uf = 10.0;
+        let circuit = h.app.read_live_circuit().unwrap();
+        let result = diode_plug_lab::solver::precharged_discharge(
+            circuit,
+            h.app.live_cap_uf,
+            100.0,
+            100.0,
+            1,
+        )
+        .unwrap();
+        assert!(result.cycles[0].port_active_power_w < 0.0);
+        assert!(result.cycles[0].source_active_power_w < 0.0);
+        assert!(result.cycles[0].energy_change_j < 0.0);
+        assert!(result.cycles[0].balance_error_w.abs() < 1e-5);
     }
 
     #[test]

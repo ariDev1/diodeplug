@@ -13,6 +13,13 @@ description: Diode‑Plug topology Energy Extraction from a Resonant AC Source w
 > negative **combined** fundamental conductance; it separately reports the
 > passive plug contribution and the return-path energy source.
 
+> **Finite-cycle precharge experiment:** The simulator's Tank & Pulse tab can
+> start with externally precharged C1/C2 and report signed **cycle-average**
+> source/port power without first settling the circuit. Negative power during
+> discharge is paid for by a decrease in stored energy; the display includes
+> load, losses and an energy-balance residual. This transient result is not a
+> sustained negative steady-state input power or a periodic operating-point G.
+
 
 This section describes the **diode‑plug** topology and derives the main formulae for voltages, currents, energies, and powers, using standard circuit theory.
 
