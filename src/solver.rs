@@ -100,7 +100,7 @@ pub struct Circuit {
     /// C2 = C1 * capacitor_ratio (1.0 = symmetric plug).
     #[serde(default = "one")]
     pub capacitor_ratio: f64,
-    /// Series ESR per plug capacitor branch (loss-only accounting at the reported branch currents).
+    /// Declared ESR estimate per plug capacitor branch; not a dynamic series element.
     #[serde(default)]
     pub capacitor_esr_ohm: f64,
     /// Parallel leakage resistance across each plug capacitor (None = none).
@@ -109,7 +109,7 @@ pub struct Circuit {
     /// Junction capacitance of each clamp diode; needed for a dynamic node A.
     #[serde(default)]
     pub diode_capacitance_f: f64,
-    /// Reverse-recovery charge per diode turn-off event (declared dissipation at turn-off).
+    /// Reverse-recovery charge per diode turn-off event (loss estimate only, not dynamic).
     #[serde(default)]
     pub diode_recovery_charge_nc: f64,
     #[serde(default)]
@@ -250,6 +250,8 @@ pub struct Metrics {
     pub load_voltage_rms_v: f64,
     pub load_voltage_mean_v: f64,
     pub load_current_rms_a: f64,
+    /// Signed average current through the resistor/EMF branch (not the parallel load capacitor).
+    pub load_branch_current_mean_a: f64,
     pub load_power_w: f64,
     pub load_resistor_power_w: f64,
     pub load_threshold_power_w: f64,
@@ -1391,7 +1393,7 @@ fn simulate_with_steps(
     }
     let dt = ctx.period / ctx.steps as f64;
     let mut waveform = Vec::with_capacity(ctx.steps + 1);
-    let mut integral = [0.0_f64; 22];
+    let mut integral = [0.0_f64; 23];
     let mut vr = (0.0, 0.0);
     let mut ir = (0.0, 0.0);
     let mut plug_ir = (0.0, 0.0);
@@ -1506,6 +1508,8 @@ fn simulate_with_steps(
             z.coil_a * z.coil_a,
             // Tank capacitor energy for swing accounting.
             tank_cap_energy,
+            // Mean DC battery/EMF current excludes displacement current in load C.
+            z.il,
         ];
         for (acc, val) in integral.iter_mut().zip(values) {
             *acc += w * val;
@@ -1559,13 +1563,13 @@ fn simulate_with_steps(
     let esr_loss = integral[18];
     let leak_loss = integral[19];
     let recovery_loss = recovery_pulse_j / ctx.period;
+    // ESR and Qrr are diagnostic estimates, not elements in evaluate()/step(). Subtracting
+    // them here incorrectly turns a physically closed numerical balance into a CHECK.
     let balance = integral[5]
         - load_power
         - integral[7]
         - integral[17]
-        - esr_loss
         - leak_loss
-        - recovery_loss
         - (energy(end) - energy(start)) / ctx.period;
     let balance_percent = 100.0 * balance.abs() / integral[5].abs().max(load_power.abs()).max(1e-3);
     let reflection =
@@ -1578,6 +1582,7 @@ fn simulate_with_steps(
         load_voltage_rms_v: integral[0].max(0.0).sqrt(),
         load_voltage_mean_v: integral[1],
         load_current_rms_a: integral[2].max(0.0).sqrt(),
+        load_branch_current_mean_a: integral[22],
         load_power_w: load_power,
         load_resistor_power_w: integral[3],
         load_threshold_power_w: integral[8],
@@ -2090,6 +2095,53 @@ mod tests {
                     < 0.01
             );
         }
+    }
+
+    #[test]
+    fn loss_only_esr_and_qrr_do_not_falsify_the_physical_energy_balance() {
+        let mut c = circuit();
+        c.inductance = 0.0;
+        let ideal = simulate(&c, 10.0, None).unwrap();
+        c.capacitor_esr_ohm = 10.0;
+        c.diode_recovery_charge_nc = 100_000.0;
+        let declared = simulate(&c, 10.0, None).unwrap();
+        assert!(declared.metrics.capacitor_esr_loss_w > 0.0);
+        assert!(declared.metrics.reverse_recovery_loss_w >= 0.0);
+        assert!((ideal.metrics.source_power_w - declared.metrics.source_power_w).abs() < 1e-9);
+        assert!(
+            (ideal.metrics.energy_balance_error_w - declared.metrics.energy_balance_error_w).abs()
+                < 1e-9
+        );
+        assert_eq!(ideal.metrics.quality_pass, declared.metrics.quality_pass);
+    }
+
+    #[test]
+    fn battery_charge_and_mains_power_are_separate_across_capacitance() {
+        let mut c = circuit();
+        c.voltage_rms = 18.0;
+        c.resistance = 0.1;
+        c.inductance = 0.0;
+        c.load_capacitance = 220e-6;
+        c.load_model = LoadModel::Battery {
+            open_circuit_voltage: 12.0,
+        };
+        let mut powers = Vec::new();
+        for cap in [5.0, 10.0, 20.0] {
+            let m = simulate(&c, cap, None).unwrap().metrics;
+            assert!(m.quality_pass, "{m:?}");
+            assert!(m.load_branch_current_mean_a >= 0.0);
+            assert!((m.load_threshold_power_w - 12.0 * m.load_branch_current_mean_a).abs() < 1e-7);
+            assert!(
+                (m.load_power_w - m.load_threshold_power_w - m.load_resistor_power_w).abs() < 1e-7
+            );
+            assert!(m.source_power_w + 1e-6 >= m.load_power_w, "{m:?}");
+            powers.push(m.source_power_w);
+        }
+        assert!(powers.iter().all(|p| p.is_finite()));
+        assert!(
+            powers[2] > powers[0] + 0.1,
+            "C had no effect on modeled mains power: {powers:?}"
+        );
     }
     #[test]
     fn resistor_energy_and_rms() {

@@ -3097,6 +3097,15 @@ impl LabApp {
             .and_then(|i| sweep.results.get(i)?.as_ref().ok());
         if let Some(point) = selected {
             let m = &point.metrics;
+            if let LoadModel::Battery {
+                open_circuit_voltage,
+            } = sweep.effective_circuit.load_model
+            {
+                ui.label(RichText::new(format!("Battery at {:.2} V EMF · C1 {:.4} µF: mains {:+.3} W, battery charging {:.3} W ({:.3} A), series-R heat {:.3} W{}",
+                    open_circuit_voltage, m.capacitance_each_uf, m.source_power_w,
+                    m.load_threshold_power_w, m.load_branch_current_mean_a,
+                    m.load_resistor_power_w, if m.quality_pass { "" } else { " · CHECK" })).strong().color(if m.quality_pass { TEAL } else { ORANGE }));
+            }
             ui.label(
                 RichText::new(format!(
                     "SELECTED  C1 {:.5} µF · C2 {:.5} µF   |   Load {:.3} V RMS / {:.3} W   |   Input {:.3} A RMS{}",
@@ -3178,6 +3187,48 @@ impl LabApp {
         let height = (ui.available_height() * 0.28).clamp(145.0, 240.0);
         ui.small("Hover to compare the nearest computed point across plots and table · click to select · failed points are skipped");
         let mut clicked_x = None;
+        if let LoadModel::Battery {
+            open_circuit_voltage,
+        } = sweep.effective_circuit.load_model
+        {
+            ui.label(
+                RichText::new(format!(
+                    "CAPACITANCE RESPONSE · battery EMF held at {open_circuit_voltage:.2} V"
+                ))
+                .strong()
+                .color(TEAL),
+            );
+            ui.small("Positive mains W = imported from AC. Positive battery W = charging the fixed-voltage battery; the curves are not the same power. No SOC or voltage rise is modeled.");
+            let response = Plot::new(("battery_capacitance_power", self.plot_generation))
+                .height(height)
+                .legend(Legend::default())
+                .x_axis_formatter(|mark, _| capacitance_tick(mark.value))
+                .label_formatter(|pos| sweep_hover(pos, &rows))
+                .show(ui, |plot| {
+                    let points = |f: fn(&diode_plug_lab::solver::Metrics) -> f64| -> Vec<[f64; 2]> {
+                        rows.iter()
+                            .map(|r| [r.metrics.capacitance_each_uf.log10(), f(&r.metrics)])
+                            .collect()
+                    };
+                    plot.line(
+                        Line::new("Mains active power (W)", points(|m| m.source_power_w))
+                            .color(TEAL)
+                            .width(2.0),
+                    );
+                    plot.line(
+                        Line::new(
+                            "Battery EMF charging power (W)",
+                            points(|m| m.load_threshold_power_w),
+                        )
+                        .color(ORANGE)
+                        .width(2.0),
+                    );
+                    plot.hline(egui_plot::HLine::new("Zero W", 0.0).color(Color32::GRAY));
+                    mark_selected(plot, selected.map(|r| &r.metrics));
+                });
+            clicked_x = clicked_x.or(clicked_plot_x(&response));
+            ui.small("C1 (µF), logarithmic spacing · only computed points, not a continuous control law.");
+        }
         ui.columns(2, |cols| {
             let (transform, x) = plot_metric(
                 &mut cols[0],
@@ -4271,6 +4322,21 @@ impl LabApp {
                 c.voltage_rms, c.frequency, c.resistance, self.live_cap_uf
             ));
         }
+        if circuit
+            .as_ref()
+            .is_ok_and(|c| matches!(c.load_model, LoadModel::Battery { .. }))
+        {
+            ui.small("Vary C: set the sweep minimum, maximum and points in the sidebar, then run the C sweep.");
+            if ui
+                .add_enabled(
+                    !self.running,
+                    egui::Button::new("Sweep C · mains and battery power"),
+                )
+                .clicked()
+            {
+                self.start(ui.ctx());
+            }
+        }
         if ui.button("Run power test").clicked() {
             self.run_power_test();
         }
@@ -4327,6 +4393,16 @@ impl LabApp {
                 if m.load_voltage_rms_v > rating.voltage_rms_v * 1.05 {
                     ui.colored_label(ORANGE, "Above lamp rating. The model cannot predict heating, resistance changes or failure; do not use these watts to judge a real lamp's safety.");
                 }
+            }
+            if let LoadModel::Battery {
+                open_circuit_voltage,
+            } = test.circuit.load_model
+            {
+                ui.label(format!("Battery charge: {:.3} A average · {:.2} W into the fixed {:.2} V EMF (plus {:.2} W heating in series R).",
+                    m.load_branch_current_mean_a, m.load_threshold_power_w,
+                    open_circuit_voltage, m.load_resistor_power_w));
+                ui.small("Battery voltage is fixed for this solve. State of charge, rising voltage and chemistry are not simulated; rerun with another EMF to compare operating points.");
+                ui.small("Mains sign: positive = power drawn from the AC source; negative = power returned to it. Positive battery power = charging.");
             }
             if test.circuit.ac_return.is_some()
                 || matches!(test.circuit.load_model, LoadModel::BidirectionalBus { .. })
@@ -7750,6 +7826,45 @@ mod ui_tests {
         h.app.form[2] = "1000".into();
         h.app.run_power_test();
         assert!(h.app.power_test.as_ref().unwrap().rating.is_none());
+    }
+
+    #[test]
+    fn power_test_reports_charging_at_the_selected_battery_voltage() {
+        let mut h = Harness::new();
+        h.app.live.playing = false;
+        let battery = presets::all()
+            .iter()
+            .position(|p| p.name == "12 V battery charging proxy")
+            .unwrap();
+        h.app.apply_preset(battery);
+        h.app.live_cap_uf = 10.0;
+        h.app.run_power_test();
+        let first = &h
+            .app
+            .power_test
+            .as_ref()
+            .expect(&h.app.power_test_message)
+            .point
+            .metrics;
+        assert!(first.quality_pass, "{first:?}");
+        assert!(first.load_branch_current_mean_a > 0.0);
+        assert!(
+            (first.load_threshold_power_w - 12.0 * first.load_branch_current_mean_a).abs() < 1e-7
+        );
+        let first_mains = first.source_power_w;
+        h.app.model_threshold = "14V".into();
+        h.app.run_power_test();
+        let next = &h
+            .app
+            .power_test
+            .as_ref()
+            .expect(&h.app.power_test_message)
+            .point
+            .metrics;
+        assert_ne!(first_mains, next.source_power_w);
+        assert!(
+            (next.load_threshold_power_w - 14.0 * next.load_branch_current_mean_a).abs() < 1e-7
+        );
     }
 
     #[test]

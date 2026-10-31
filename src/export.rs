@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-const HEADER_LEN: usize = 48;
+const HEADER_LEN: usize = 49;
 
 fn resolution_stages(check: &crate::validation::ResolutionCheck) -> String {
     let mut text = Vec::new();
@@ -45,7 +45,7 @@ pub fn write(sweep: &Sweep, folder: &Path) -> Result<(), String> {
     serde_json::to_writer_pretty(json, sweep).map_err(|e| e.to_string())?;
     let mut table =
         BufWriter::new(File::create(folder.join("sweep.csv")).map_err(|e| e.to_string())?);
-    writeln!(table, "C_each_uF,load_V_rms,load_total_W,load_resistor_W,load_threshold_W,input_A_rms,Zin_real_ohm,Zin_imag_ohm,G_total_S,B_total_S,reflection,source_W,port_W,diode_loss_W,source_R_loss_W,cap_esr_loss_W,cap_leakage_loss_W,reverse_recovery_loss_W,cap_energy_swing_J,diode_1_peak_A,diode_2_peak_A,fundamental_P_W,fundamental_Q_var,input_THD,balance_percent,quality_pass,convergence,cycles,G_plug_only_S,B_plug_only_S,R_parallel_ohm,AC_return_W_absorbed,AC_return_W_supplied,port_negative_fraction,port_return_J_per_cycle,source_return_J_per_cycle,source_coil_A_rms,source_coil_energy_swing_J,calculation_checks,resolution_base_steps,resolution_refined_steps,resolution_max_delta_percent,resolution_refined_balance_percent,resolution_initial_issues,resolution_stages,resolution_accepted_steps,resolution_trend,error")
+    writeln!(table, "C_each_uF,load_V_rms,load_total_W,load_resistor_W,load_threshold_W,load_branch_A_mean,input_A_rms,Zin_real_ohm,Zin_imag_ohm,G_total_S,B_total_S,reflection,source_W,port_W,diode_loss_W,source_R_loss_W,cap_esr_loss_W,cap_leakage_loss_W,reverse_recovery_loss_W,cap_energy_swing_J,diode_1_peak_A,diode_2_peak_A,fundamental_P_W,fundamental_Q_var,input_THD,balance_percent,quality_pass,convergence,cycles,G_plug_only_S,B_plug_only_S,R_parallel_ohm,AC_return_W_absorbed,AC_return_W_supplied,port_negative_fraction,port_return_J_per_cycle,source_return_J_per_cycle,source_coil_A_rms,source_coil_energy_swing_J,calculation_checks,resolution_base_steps,resolution_refined_steps,resolution_max_delta_percent,resolution_refined_balance_percent,resolution_initial_issues,resolution_stages,resolution_accepted_steps,resolution_trend,error")
         .map_err(|e| e.to_string())?;
     for (i, point) in sweep.results.iter().enumerate() {
         match point {
@@ -57,6 +57,7 @@ pub fn write(sweep: &Sweep, folder: &Path) -> Result<(), String> {
                     m.load_power_w.to_string(),
                     m.load_resistor_power_w.to_string(),
                     m.load_threshold_power_w.to_string(),
+                    m.load_branch_current_mean_a.to_string(),
                     m.input_current_rms_a.to_string(),
                     m.input_impedance_real_ohm.to_string(),
                     m.input_impedance_imag_ohm.to_string(),
