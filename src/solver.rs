@@ -450,7 +450,7 @@ impl Context<'_> {
         ];
         for (one, two, a, b) in combos {
             let va = if a > 0.0 {
-                (vs / rs - b) / (a + 1.0 / rs)
+                (vs - rs * b) / (1.0 + rs * a)
             } else {
                 // both off: (vs - va)/rs + leak = 0  ->  va = vs + rs*leak
                 vs + rs * leak
@@ -729,6 +729,7 @@ pub struct Transient {
     source_phase_offset: f64,
     history: VecDeque<Trace>,
     integration_steps: u64,
+    steps_override: Option<usize>,
 }
 
 /// Retain more than the widest scope capture so crossings remain eligible
@@ -799,6 +800,7 @@ impl Transient {
             source_phase_offset: 0.0,
             history: VecDeque::with_capacity(LIVE_HISTORY_SAMPLES),
             integration_steps: 0,
+            steps_override: None,
         };
         run.advance(0)?;
         Ok(run)
@@ -808,7 +810,9 @@ impl Transient {
         self.time_s
     }
     pub fn steps_per_cycle(&self) -> usize {
-        transient_context(&self.circuit, self.cap_uf, self.source_phase_offset).steps
+        self.steps_override.unwrap_or_else(|| {
+            transient_context(&self.circuit, self.cap_uf, self.source_phase_offset).steps
+        })
     }
 
     /// Set initial plug-capacitor voltages before advancing the clock. This is
@@ -876,7 +880,10 @@ impl Transient {
             return Err("Live integration chunk exceeds 512 steps".into());
         }
         let circuit = self.circuit.clone();
-        let ctx = transient_context(&circuit, self.cap_uf, self.source_phase_offset);
+        let mut ctx = transient_context(&circuit, self.cap_uf, self.source_phase_offset);
+        if let Some(steps) = self.steps_override {
+            ctx.steps = steps;
+        }
         // Keep roughly 3k recorded scope points per slowest configured cycle,
         // including a slower pulse gate. The solver still takes every step.
         let gate_ratio = circuit.pulse_gate.as_ref().map_or(1.0, |gate| {
@@ -971,30 +978,49 @@ pub struct DischargeCycle {
     pub source_active_power_w: f64,
     pub port_active_power_w: f64,
     pub load_active_power_w: f64,
+    /// Positive = externally powered AC return absorbs energy; negative = supplies it.
+    pub ac_return_power_w: f64,
+    /// Signed battery/LED/bus threshold contribution (negative = powered bus supplies energy).
+    pub dc_bus_power_w: f64,
     pub energy_change_j: f64,
+    /// Physical Rs, diode and leakage losses used in the energy-balance check.
     pub dissipation_w: f64,
+    /// Declared ESR loss (loss-only in the solver; not taken out of stored energy).
+    pub declared_esr_loss_w: f64,
     pub balance_error_w: f64,
+    /// True when the independently evaluated energy balance closes to 1%.
+    pub quality_pass: bool,
     pub returned_energy_j: f64,
 }
 
 #[derive(Clone, Debug)]
 pub struct PrechargedDischarge {
     pub capacitance_each_uf: f64,
+    pub diode_junction_capacitance_f: f64,
+    pub has_powered_return: bool,
+    pub has_powered_bus: bool,
+    pub qrr_not_modeled_nc: f64,
     pub initial_energy_j: f64,
     pub cycles: Vec<DischargeCycle>,
     pub waveform: Vec<Trace>,
 }
 
-fn transient_stored_energy(trace: &Trace) -> f64 {
+fn transient_stored_energy(trace: &Trace, circuit: &Circuit) -> f64 {
     trace.capacitor_1_energy_j
         + trace.capacitor_2_energy_j
         + trace.load_capacitor_energy_j
         + trace.load_inductor_energy_j
         + trace.source_coil_energy_j
+        + if circuit.source_inductance > 0.0 {
+            0.5 * circuit.diode_capacitance_f * (trace.node_p_v.powi(2) + trace.node_n_v.powi(2))
+        } else {
+            0.0
+        }
 }
 
-/// Run a finite, un-settled discharge experiment with a passive load.
-/// Losses are calculated independently from source/diode/ESR/leakage currents.
+/// Run a finite, un-settled discharge experiment using the selected circuit.
+/// The powered AC return and DC bus (if present) are accounted for explicitly.
+/// ESR and Qrr remain declared loss-only models and do not change the states.
 pub fn precharged_discharge(
     circuit: Circuit,
     cap_uf: f64,
@@ -1005,26 +1031,14 @@ pub fn precharged_discharge(
     if !(1..=8).contains(&cycles) {
         return Err("Discharge duration must be 1–8 complete source cycles".into());
     }
-    if circuit.ac_return.is_some()
-        || circuit.load_model != LoadModel::Linear
-        || circuit.pulse_gate.is_some()
-        || circuit.diode_recovery_charge_nc != 0.0
-    {
-        return Err(
-            "Discharge probe requires a passive linear load, no gate, powered return or Qrr".into(),
-        );
-    }
-    if circuit.source_inductance != 0.0 {
-        return Err("Discharge probe currently requires source Ls = 0 H".into());
-    }
-    if circuit.source_resistance <= 0.0 {
-        return Err("Discharge probe requires source Rs > 0 Ω".into());
-    }
     let mut run = Transient::new(circuit.clone(), cap_uf)?;
+    if circuit.source_inductance > 0.0 {
+        run.steps_override = Some(20_000);
+    }
     run.precharge(c1_v, c2_v)?;
     let steps = run.steps_per_cycle();
     let period = 1.0 / circuit.frequency;
-    let initial_energy_j = transient_stored_energy(run.history.back().unwrap());
+    let initial_energy_j = transient_stored_energy(run.history.back().unwrap(), &circuit);
     if !initial_energy_j.is_finite() {
         return Err("Initial capacitor energy must be finite".into());
     }
@@ -1049,36 +1063,58 @@ pub fn precharged_discharge(
         let mut port_j = 0.0;
         let mut load_j = 0.0;
         let mut loss_j = 0.0;
+        let mut esr_j = 0.0;
+        let mut ac_return_j = 0.0;
+        let mut bus_j = 0.0;
         let mut returned_j = 0.0;
         for pair in samples.windows(2) {
             let dt = pair[1].time_s - pair[0].time_s;
             source_j += dt * (pair[0].input_power_w + pair[1].input_power_w) / 2.0;
             port_j += dt * (pair[0].port_power_w + pair[1].port_power_w) / 2.0;
-            let load_dissipation =
-                |w: &Trace| circuit.resistance * (w.load_a - w.load_capacitor_a).powi(2);
-            load_j += dt * (load_dissipation(&pair[0]) + load_dissipation(&pair[1])) / 2.0;
+            let branch = |w: &Trace| w.load_a - w.load_capacitor_a;
+            let load_power = |w: &Trace| {
+                circuit.resistance * branch(w).powi(2) + circuit.load_model.threshold() * branch(w)
+            };
+            load_j += dt * (load_power(&pair[0]) + load_power(&pair[1])) / 2.0;
+            ac_return_j += dt * (pair[0].return_path_power_w + pair[1].return_path_power_w) / 2.0;
+            bus_j +=
+                dt * circuit.load_model.threshold() * (branch(&pair[0]) + branch(&pair[1])) / 2.0;
             let loss = |w: &Trace| {
                 circuit.source_resistance * w.input_a.powi(2)
                     + circuit.diode_drop * (w.diode_1_a + w.diode_2_a)
                     + circuit.diode_resistance * (w.diode_1_a.powi(2) + w.diode_2_a.powi(2))
-                    + circuit.capacitor_esr_ohm
-                        * (w.capacitor_1_a.powi(2) + w.capacitor_2_a.powi(2))
                     + circuit.capacitor_leakage_parallel_ohm.map_or(0.0, |r| {
                         ((w.port_v - w.node_p_v).powi(2) + (w.port_v - w.node_n_v).powi(2)) / r
                     })
             };
             loss_j += dt * (loss(&pair[0]) + loss(&pair[1])) / 2.0;
+            let esr = |w: &Trace| {
+                circuit.capacitor_esr_ohm * (w.capacitor_1_a.powi(2) + w.capacitor_2_a.powi(2))
+            };
+            esr_j += dt * (esr(&pair[0]) + esr(&pair[1])) / 2.0;
             returned_j +=
                 dt * ((-pair[0].input_power_w).max(0.0) + (-pair[1].input_power_w).max(0.0)) / 2.0;
         }
-        let change = transient_stored_energy(last) - transient_stored_energy(first);
+        let change =
+            transient_stored_energy(last, &circuit) - transient_stored_energy(first, &circuit);
         let dissipation = loss_j / period;
-        let balance_error = source_j - load_j - change - loss_j;
+        let balance_error = source_j - ac_return_j - load_j - change - loss_j;
+        let quality_scale = source_j
+            .abs()
+            .max(ac_return_j.abs())
+            .max(load_j.abs())
+            .max(change.abs())
+            .max(loss_j.abs())
+            .max(1e-6);
+        let quality_pass = balance_error.abs() <= 0.01 * quality_scale;
         if ![
             source_j,
             port_j,
             load_j,
             loss_j,
+            esr_j,
+            ac_return_j,
+            bus_j,
             change,
             balance_error,
             returned_j,
@@ -1093,9 +1129,13 @@ pub fn precharged_discharge(
             source_active_power_w: source_j / period,
             port_active_power_w: port_j / period,
             load_active_power_w: load_j / period,
+            ac_return_power_w: ac_return_j / period,
+            dc_bus_power_w: bus_j / period,
             energy_change_j: change,
             dissipation_w: dissipation,
+            declared_esr_loss_w: esr_j / period,
             balance_error_w: balance_error,
+            quality_pass,
             returned_energy_j: returned_j,
         });
         if number == 1 {
@@ -1104,6 +1144,14 @@ pub fn precharged_discharge(
     }
     Ok(PrechargedDischarge {
         capacitance_each_uf: cap_uf,
+        diode_junction_capacitance_f: if circuit.source_inductance > 0.0 {
+            circuit.diode_capacitance_f
+        } else {
+            0.0
+        },
+        has_powered_return: circuit.ac_return.is_some(),
+        has_powered_bus: matches!(circuit.load_model, LoadModel::BidirectionalBus { .. }),
+        qrr_not_modeled_nc: circuit.diode_recovery_charge_nc,
         initial_energy_j,
         cycles: summaries,
         waveform,
@@ -1918,6 +1966,82 @@ mod tests {
                 .iter()
                 .all(|cycle| cycle.balance_error_w.abs() < 0.002)
         );
+    }
+
+    #[test]
+    fn precharged_probe_accepts_datasheet_diode_and_source_inductance() {
+        let mut c = circuit();
+        c.source_inductance = 1e-3;
+        c.diode_capacitance_f = 1e-9;
+        c.diode_recovery_charge_nc = 100.0;
+        let result = precharged_discharge(c, 10.0, 40.0, 40.0, 1).unwrap();
+        let cycle = &result.cycles[0];
+        assert!(result.initial_energy_j > 0.016); // includes junction capacitance
+        assert!(cycle.source_active_power_w.is_finite());
+        assert!(
+            !cycle.quality_pass,
+            "tiny Cj transient must be flagged CHECK: {cycle:?}"
+        );
+        assert_eq!(result.qrr_not_modeled_nc, 100.0);
+
+        let mut resolvable = circuit();
+        resolvable.source_inductance = 0.05;
+        resolvable.diode_capacitance_f = 1e-8;
+        let resolved = precharged_discharge(resolvable, 10.0, 0.0, 0.0, 1).unwrap();
+        assert!(resolved.cycles[0].quality_pass, "{:?}", resolved.cycles[0]);
+    }
+
+    #[test]
+    fn precharged_probe_accounts_for_external_power_and_load_gate() {
+        let mut c = circuit();
+        c.inductance = 0.0;
+        c.ac_return = Some(AcReturn {
+            current_rms_a: 0.1,
+            phase_deg: 0.0,
+        });
+        c.load_model = LoadModel::BidirectionalBus { emf_voltage: 8.0 };
+        c.pulse_gate = Some(PulseGate {
+            repetition_hz: 50.0,
+            duty: 0.5,
+        });
+        c.capacitor_esr_ohm = 0.01;
+        let result = precharged_discharge(c, 10.0, 20.0, 20.0, 1).unwrap();
+        let cycle = &result.cycles[0];
+        assert!(result.has_powered_return && result.has_powered_bus);
+        assert!(cycle.ac_return_power_w.is_finite());
+        assert!(cycle.dc_bus_power_w.is_finite());
+        assert!(cycle.declared_esr_loss_w > 0.0);
+        assert!(cycle.balance_error_w.abs() < 0.02, "{cycle:?}");
+        assert!(cycle.quality_pass, "{cycle:?}");
+    }
+
+    #[test]
+    fn precharged_probe_supports_zero_source_resistance() {
+        let mut c = circuit();
+        c.source_resistance = 0.0;
+        let result = precharged_discharge(c, 10.0, 20.0, 20.0, 1).unwrap();
+        let cycle = &result.cycles[0];
+        assert!(cycle.source_active_power_w.is_finite());
+        assert!((cycle.source_active_power_w - cycle.port_active_power_w).abs() < 1e-9);
+    }
+
+    #[test]
+    fn precharged_probe_accepts_all_load_branch_choices() {
+        for model in [
+            LoadModel::Linear,
+            LoadModel::Led { knee_voltage: 5.0 },
+            LoadModel::Battery {
+                open_circuit_voltage: 5.0,
+            },
+            LoadModel::BidirectionalBus { emf_voltage: 5.0 },
+        ] {
+            let mut c = circuit();
+            c.inductance = 0.0;
+            c.load_model = model;
+            let result = precharged_discharge(c, 10.0, 20.0, 20.0, 1).unwrap();
+            assert!(result.cycles[0].source_active_power_w.is_finite());
+            assert!(result.cycles[0].quality_pass, "{:?}", result.cycles[0]);
+        }
     }
     #[test]
     fn resistor_energy_and_rms() {

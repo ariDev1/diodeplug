@@ -4204,24 +4204,18 @@ impl LabApp {
                 ui.colored_label(
                     ORANGE,
                     format!(
-                        "⚠ Diode Qrr = {} nC. This probe cannot account for Qrr yet.",
+                        "Model note: Qrr = {} nC is not applied to transient states or this energy ledger; the probe still runs with your selected diode.",
                         format_component(circuit.diode_recovery_charge_nc)
                     ),
                 );
-                if ui.button("Set Qrr to 0 for this probe").clicked() {
-                    self.cap_advanced = true;
-                    self.diode_qrr_form = "0".into();
-                    self.precharged_result = None;
-                    self.precharged_message =
-                        "Qrr set to 0 in the sidebar; rerun the probe.".into();
-                }
             }
-            if circuit.source_inductance > 0.0
-                || circuit.ac_return.is_some()
-                || circuit.pulse_gate.is_some()
-                || circuit.load_model != LoadModel::Linear
+            if circuit.ac_return.is_some()
+                || matches!(circuit.load_model, LoadModel::BidirectionalBus { .. })
             {
-                ui.colored_label(ORANGE, "This probe requires a passive linear load, Ls off, load gate off and external AC return off. Change these in the sidebar or load the example.");
+                ui.colored_label(ORANGE, "External powered AC return / DC bus is enabled: a negative mains reading may come from it, not the precharged capacitors. Its power is reported separately below.");
+            }
+            if circuit.source_inductance > 0.0 && circuit.diode_capacitance_f == 0.0 {
+                ui.colored_label(ORANGE, "Ls needs a nonzero diode Cj to define the clamp-node voltage; this is also required by Live. Enter a datasheet Cj or disable Ls.");
             }
         }
         ui.horizontal_wrapped(|ui| {
@@ -4273,11 +4267,16 @@ impl LabApp {
             let cap = self.mains_probe_cap_uf()? * 1e-6;
             let c1 = units::parse(&self.discharge_c1_v, Unit::Volt, 1.0)?;
             let c2 = units::parse(&self.discharge_c2_v, Unit::Volt, 1.0)?;
-            Ok::<_, String>(0.5 * cap * (c1 * c1 + circuit.capacitor_ratio * c2 * c2))
+            let junction = if circuit.source_inductance > 0.0 {
+                0.5 * circuit.diode_capacitance_f * (c1 * c1 + c2 * c2)
+            } else {
+                0.0
+            };
+            Ok::<_, String>(0.5 * cap * (c1 * c1 + circuit.capacitor_ratio * c2 * c2) + junction)
         })();
         if let Ok(energy) = initial {
             ui.label(format!(
-                "Externally supplied initial plug-capacitor energy: {:.6} J",
+                "Initial stored capacitor energy (including Cj when Ls is on): {:.6} J",
                 energy
             ));
         }
@@ -4305,17 +4304,29 @@ impl LabApp {
             ui.separator();
             ui.label(RichText::new("FIRST COMPLETE SOURCE CYCLE · MAINS ACTIVE POWER").strong());
             ui.label(
-                RichText::new(format!("{:+.4} W", first.source_active_power_w))
-                    .size(28.0)
-                    .strong()
-                    .color(if first.source_active_power_w < 0.0 {
+                RichText::new(format!(
+                    "{:+.4} W{}",
+                    first.source_active_power_w,
+                    if first.quality_pass { "" } else { " · CHECK" }
+                ))
+                .size(28.0)
+                .strong()
+                .color(
+                    if first.source_active_power_w < 0.0 && first.quality_pass {
                         TEAL
                     } else {
                         ORANGE
-                    }),
+                    },
+                ),
             );
-            ui.label(if first.source_active_power_w < 0.0 {
-                "Energy returned to the source during this cycle; check the stored-energy change and balance below."
+            ui.label(if !first.quality_pass {
+                "CHECK: energy balance did not close within 1%. Do not interpret the power sign as reliable for these settings."
+            } else if first.source_active_power_w < 0.0 && (result.has_powered_return || result.has_powered_bus) {
+                "Energy returned to the source; an external powered return or DC bus is enabled. Do not attribute this reading to precharged capacitors alone."
+            } else if first.source_active_power_w < 0.0 && first.energy_change_j < 0.0 {
+                "Energy returned to the source while stored energy fell. Compare the energy change with load, losses and balance below."
+            } else if first.source_active_power_w < 0.0 {
+                "Negative source power without falling stored energy: inspect the external power terms and balance before interpreting this result."
             } else {
                 "Net energy was drawn from the source during this cycle; negative instantaneous power can still occur."
             });
@@ -4335,9 +4346,13 @@ impl LabApp {
                                 "Mains W",
                                 "Plug port W",
                                 "Load W",
+                                "AC return W",
+                                "DC threshold W",
                                 "Δstored J",
                                 "Losses W",
+                                "ESR estimate W",
                                 "Balance error J",
+                                "Quality",
                             ] {
                                 ui.strong(header);
                             }
@@ -4354,15 +4369,26 @@ impl LabApp {
                                 );
                                 ui.label(format!("{:+.4}", c.port_active_power_w));
                                 ui.label(format!("{:.4}", c.load_active_power_w));
+                                ui.label(format!("{:+.4}", c.ac_return_power_w));
+                                ui.label(format!("{:+.4}", c.dc_bus_power_w));
                                 ui.label(format!("{:+.6}", c.energy_change_j));
                                 ui.label(format!("{:.4}", c.dissipation_w));
+                                ui.label(format!("{:.4}", c.declared_esr_loss_w));
                                 ui.label(format!("{:+.2e}", c.balance_error_w));
+                                ui.colored_label(
+                                    if c.quality_pass { TEAL } else { ORANGE },
+                                    if c.quality_pass { "OK" } else { "CHECK" },
+                                );
                                 ui.end_row();
                             }
                         });
                 });
             ui.small(format!("First-cycle gross mains return (negative portions only): {:.6} J. This is not net export; use signed mains W above.", first.returned_energy_j));
-            ui.small("Source includes Rs; port is after Rs. A negative port cycle does not necessarily mean negative mains power. Balance error should be small versus transferred energy; refine/verify before interpreting a marginal sign.");
+            ui.small("Source includes Rs; port is after Rs. Negative AC-return W or DC-threshold W means an external source supplies power. Load W includes the signed DC threshold. ESR estimate is declared loss-only: it does not change the transient states and is excluded from the physical balance residual.");
+            if result.qrr_not_modeled_nc > 0.0 {
+                ui.colored_label(ORANGE, format!("Qrr = {} nC is selected but is not a dynamic reverse-recovery model. It is excluded from this finite-cycle loss and balance calculation.", format_component(result.qrr_not_modeled_nc)));
+            }
+            ui.small("Balance error should be small versus transferred energy; refine/verify before interpreting a marginal sign.");
             ui.label(RichText::new("FIRST-CYCLE WAVEFORMS").strong());
             Plot::new("precharged_mains_power")
                 .height(190.0)
@@ -4408,7 +4434,10 @@ impl LabApp {
                                             + w.capacitor_2_energy_j
                                             + w.load_capacitor_energy_j
                                             + w.load_inductor_energy_j
-                                            + w.source_coil_energy_j,
+                                            + w.source_coil_energy_j
+                                            + 0.5
+                                                * result.diode_junction_capacitance_f
+                                                * (w.node_p_v.powi(2) + w.node_n_v.powi(2)),
                                     ]
                                 })
                                 .collect::<Vec<_>>(),
@@ -4416,7 +4445,7 @@ impl LabApp {
                         .color(TEAL),
                     );
                 });
-            ui.small("Total modeled stored energy, first cycle · time in ms. Changes in the model's loss-only ESR do not feed back into the voltages; use the balance error to judge numerical consistency.");
+            ui.small("Total modeled stored energy, first cycle · time in ms. Declared ESR and Qrr do not feed back into transient voltages; see the separate terms and balance error.");
         }
     }
 
@@ -7313,6 +7342,7 @@ mod ui_tests {
         assert!(result.cycles[0].port_active_power_w < 0.0);
         assert!(result.cycles[0].source_active_power_w < 0.0);
         assert!(result.cycles[0].energy_change_j < 0.0);
+        assert!(result.cycles[0].quality_pass);
         assert!(result.cycles[0].balance_error_w.abs() < 1e-5);
     }
 
@@ -7349,7 +7379,7 @@ mod ui_tests {
     }
 
     #[test]
-    fn selected_diode_qrr_is_explained_before_mains_probe_runs() {
+    fn selected_diode_qrr_does_not_block_or_change_the_probe() {
         let mut h = Harness::new();
         h.app.live.playing = false;
         h.app.load_mains_return_example();
@@ -7359,15 +7389,49 @@ mod ui_tests {
             .unwrap();
         h.app.apply_diode_model(index);
         h.app.run_mains_probe();
-        assert!(h.app.precharged_result.is_none());
-        assert!(h.app.precharged_message.contains("Qrr"));
-        h.app.diode_qrr_form = "0".into();
+        let result = h
+            .app
+            .precharged_result
+            .as_ref()
+            .expect(&h.app.precharged_message);
+        assert_eq!(result.qrr_not_modeled_nc, 100.0);
+        assert!(result.cycles[0].source_active_power_w.is_finite());
+        assert_eq!(
+            h.app.read_live_circuit().unwrap().diode_recovery_charge_nc,
+            100.0
+        );
+    }
+
+    #[test]
+    fn motor_run_capacitor_and_diode_work_without_changing_sidebar() {
+        let mut h = Harness::new();
+        h.app.live.playing = false;
+        h.app.load_mains_return_example();
+        let cap = CAPACITOR_MODELS
+            .iter()
+            .position(|m| m.name == "Motor-run 10 µF / 450 VAC")
+            .unwrap();
+        let diode = DIODE_MODELS
+            .iter()
+            .position(|m| m.name == "MUR4100E")
+            .unwrap();
+        h.app.apply_capacitor_model(cap);
+        h.app.apply_diode_model(diode);
+        let before = h.app.read_live_circuit().unwrap();
         h.app.run_mains_probe();
         assert!(
             h.app.precharged_result.is_some(),
             "{}",
             h.app.precharged_message
         );
+        let after = h.app.read_live_circuit().unwrap();
+        assert_eq!(
+            after.diode_recovery_charge_nc,
+            before.diode_recovery_charge_nc
+        );
+        assert_eq!(after.capacitor_esr_ohm, before.capacitor_esr_ohm);
+        assert_eq!(h.app.current_capacitor_model(), Some(cap));
+        assert_eq!(h.app.current_diode_model(), Some(diode));
     }
 
     #[test]

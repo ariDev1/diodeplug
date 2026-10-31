@@ -19,6 +19,10 @@ description: Diode‑Plug topology Energy Extraction from a Resonant AC Source w
 > discharge is paid for by a decrease in stored energy; the display includes
 > load, losses and an energy-balance residual. This transient result is not a
 > sustained negative steady-state input power or a periodic operating-point G.
+> If an external powered return or DC bus is selected, its contribution is
+> separately reported; a negative mains reading must not then be attributed
+> to the precharged capacitors alone. Cycles marked CHECK fail the numerical
+> energy-balance criterion and should not be interpreted as reliable predictions.
 
 
 This section describes the **diode‑plug** topology and derives the main formulae for voltages, currents, energies, and powers, using standard circuit theory.
