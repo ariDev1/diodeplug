@@ -720,6 +720,12 @@ impl RunPerformance {
     }
 }
 
+struct SimplePowerTest {
+    point: ResultPoint,
+    circuit: Circuit,
+    rating: Option<presets::LoadRating>,
+}
+
 struct LabApp {
     config: Config,
     form: [String; 12],
@@ -798,6 +804,8 @@ struct LabApp {
     discharge_c2_v: String,
     discharge_cycles: String,
     experiment_page: usize,
+    power_test: Option<SimplePowerTest>,
+    power_test_message: String,
     probe_use_selected_c1: bool,
     precharged_result: Option<diode_plug_lab::solver::PrechargedDischarge>,
     precharged_rating: Option<presets::LoadRating>,
@@ -1185,6 +1193,8 @@ impl LabApp {
             discharge_c2_v: "0V".into(),
             discharge_cycles: "3".into(),
             experiment_page: 0,
+            power_test: None,
+            power_test_message: String::new(),
             probe_use_selected_c1: false,
             precharged_result: None,
             precharged_rating: None,
@@ -1356,6 +1366,8 @@ impl LabApp {
         self.discharge_c2_v = "0V".into();
         self.discharge_cycles = "3".into();
         self.experiment_page = 0;
+        self.power_test = None;
+        self.power_test_message.clear();
         self.probe_use_selected_c1 = false;
         self.precharged_result = None;
         self.precharged_rating = None;
@@ -3955,7 +3967,7 @@ impl LabApp {
     fn reference_equations(&mut self, ui: &mut egui::Ui) {
         ui.heading("Experiments");
         ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.experiment_page, 0, "Power flow / precharge");
+            ui.selectable_value(&mut self.experiment_page, 0, "Power test");
             ui.selectable_value(&mut self.experiment_page, 1, "Resonant tank");
             ui.selectable_value(&mut self.experiment_page, 2, "Capacitor pulses");
         });
@@ -4223,7 +4235,118 @@ impl LabApp {
         }
     }
 
+    fn run_power_test(&mut self) {
+        let outcome = (|| {
+            let circuit = self.read_live_circuit()?;
+            let rating = self.current_lamp_rating(&circuit);
+            let point = diode_plug_lab::solver::simulate(&circuit, self.live_cap_uf, None)?;
+            Ok::<_, String>(SimplePowerTest {
+                point,
+                circuit,
+                rating,
+            })
+        })();
+        match outcome {
+            Ok(test) => {
+                self.power_test = Some(test);
+                self.power_test_message =
+                    "Last test result. Run again after changing sidebar inputs.".into();
+            }
+            Err(error) => {
+                self.power_test = None;
+                self.power_test_message = error;
+            }
+        }
+    }
+
     fn mains_return_view(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Power test");
+        ui.label(
+            "Use the circuit on the left. Press Run to compare power at the mains and at the load.",
+        );
+        let circuit = self.read_live_circuit();
+        if let Ok(c) = &circuit {
+            ui.label(format!(
+                "Input: {:.0} V RMS / {:.0} Hz   ·   Load: {:.1} Ω   ·   Plug C1: {:.4} µF",
+                c.voltage_rms, c.frequency, c.resistance, self.live_cap_uf
+            ));
+        }
+        if ui.button("Run power test").clicked() {
+            self.run_power_test();
+        }
+        if !self.power_test_message.is_empty() {
+            ui.colored_label(
+                if self.power_test.is_some() {
+                    MUTED
+                } else {
+                    ORANGE
+                },
+                &self.power_test_message,
+            );
+        }
+        if let Some(test) = &self.power_test {
+            let m = &test.point.metrics;
+            ui.separator();
+            ui.label(
+                RichText::new("MODEL RESULT · AFTER SETTLING")
+                    .strong()
+                    .color(TEAL),
+            );
+            egui::Grid::new("simple_power_test_readings")
+                .spacing([18.0, 8.0])
+                .show(ui, |ui| {
+                    ui.strong("Mains input");
+                    ui.label(
+                        RichText::new(format!("{:+.2} W", m.source_power_w))
+                            .size(22.0)
+                            .strong(),
+                    );
+                    ui.end_row();
+                    ui.strong("Load power");
+                    ui.label(
+                        RichText::new(format!("{:+.2} W", m.load_power_w))
+                            .size(22.0)
+                            .strong(),
+                    );
+                    ui.end_row();
+                    ui.strong("Voltage across load");
+                    ui.label(
+                        RichText::new(format!("{:.1} V RMS", m.load_voltage_rms_v))
+                            .size(22.0)
+                            .strong(),
+                    );
+                    ui.end_row();
+                });
+            ui.small(format!("Calculated with {:.4} µF plug C1. These are separate measurements, not a lamp's nameplate rating.", m.capacitance_each_uf));
+            if !m.quality_pass {
+                ui.colored_label(ORANGE, "CHECK: this simulation did not pass its numerical consistency checks. Do not rely on these numbers.");
+            }
+            if let Some(rating) = test.rating {
+                ui.label(format!("Lamp rating: {:.0} W at {:.0} V RMS across it; modeled here as a fixed {:.0} Ω hot resistor.",
+                    rating.power_w, rating.voltage_rms_v, test.circuit.resistance));
+                if m.load_voltage_rms_v > rating.voltage_rms_v * 1.05 {
+                    ui.colored_label(ORANGE, "Above lamp rating. The model cannot predict heating, resistance changes or failure; do not use these watts to judge a real lamp's safety.");
+                }
+            }
+            if test.circuit.ac_return.is_some()
+                || matches!(test.circuit.load_model, LoadModel::BidirectionalBus { .. })
+            {
+                ui.colored_label(ORANGE, "An external powered return or DC bus is enabled. Mains power may include energy supplied by it, not just the plug capacitors.");
+            }
+            ui.small("A settled electrical model, not a hardware measurement. ESR and diode recovery use simplified loss estimates.");
+        } else if let Err(error) = circuit {
+            ui.colored_label(ORANGE, format!("Check the sidebar inputs: {error}"));
+        }
+        ui.add_space(12.0);
+        ui.collapsing(
+            "Advanced · startup, precharge and cycle-by-cycle energy",
+            |ui| {
+                self.advanced_mains_return_view(ui);
+            },
+        );
+    }
+
+    fn advanced_mains_return_view(&mut self, ui: &mut egui::Ui) {
         ui.heading("Power flow · startup / precharge experiment");
         ui.label("Compare power drawn at the source with power at the load and energy stored in the capacitors over complete AC cycles.");
         ui.small("This is a transient from your chosen initial capacitor voltages, not a steady-state wattage prediction. Negative source power means net return for that cycle only.");
@@ -5371,18 +5494,7 @@ impl LabApp {
                             c.voltage_rms, c.frequency
                         )
                     }),
-                self.mains_probe_cap_uf()
-                    .map_or("Choose a plug C1".into(), |c| {
-                        format!(
-                            "Plug C1 {:.4} µF  ·  {}",
-                            c,
-                            if self.probe_use_selected_c1 {
-                                "selected sweep point"
-                            } else {
-                                "Live / preset"
-                            }
-                        )
-                    }),
+                format!("Live plug C1 {:.4} µF", self.live_cap_uf),
             )
         } else if self.tab == 7 {
             (
@@ -5411,21 +5523,17 @@ impl LabApp {
             )
         };
         let selected = if self.tab == 3 && self.experiment_page == 0 {
-            self.precharged_result.as_ref().map_or(
-                "Run power flow to compare source and load".into(),
-                |r| {
+            self.power_test
+                .as_ref()
+                .map_or("Press Run power test".into(), |test| {
+                    let m = &test.point.metrics;
                     format!(
-                        "Last run, cycle 1: mains {:+.2} W · load {:.2} W{}",
-                        r.cycles[0].source_active_power_w,
-                        r.cycles[0].load_active_power_w,
-                        if r.cycles[0].quality_pass {
-                            ""
-                        } else {
-                            " · CHECK"
-                        }
+                        "Last test: mains {:+.2} W · load {:+.2} W{}",
+                        m.source_power_w,
+                        m.load_power_w,
+                        if m.quality_pass { "" } else { " · CHECK" }
                     )
-                },
-            )
+                })
         } else if self.tab == 7 {
             self.live
                 .samples
@@ -5465,7 +5573,7 @@ impl LabApp {
                 if self.tab == 7 {
                     "LIVE CAPACITANCE"
                 } else if self.tab == 3 && self.experiment_page == 0 {
-                    "PROBE CAPACITANCE"
+                    "TEST CAPACITANCE"
                 } else {
                     "CAPACITANCE SWEEP"
                 },
@@ -5475,7 +5583,7 @@ impl LabApp {
                 if self.tab == 7 {
                     "LIVE STATE"
                 } else if self.tab == 3 && self.experiment_page == 0 {
-                    "CYCLE 1 · SOURCE / LOAD"
+                    "MAINS / LOAD"
                 } else {
                     "SELECTED LOAD"
                 },
@@ -7609,6 +7717,39 @@ mod ui_tests {
             LabApp::lamp_rating_for_preset(Some("120 V / 60 W incandescent"), &saved_circuit)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn simple_power_test_uses_live_circuit_and_c1_without_changing_saved_sweep() {
+        let mut h = Harness::new();
+        h.app.live.playing = false;
+        let lamp = presets::all()
+            .iter()
+            .position(|p| p.name == "240 V / 20 W incandescent")
+            .unwrap();
+        h.app.apply_preset(lamp);
+        h.app.live_cap_uf = 10.0;
+        let saved = h.app.sweep.as_ref().map(|s| s.results.len());
+        let selected = h.app.selected;
+        let before = h.app.read_live_circuit().unwrap();
+        h.app.run_power_test();
+        let test = h.app.power_test.as_ref().expect(&h.app.power_test_message);
+        let m = &test.point.metrics;
+        assert_eq!(m.capacitance_each_uf, 10.0);
+        assert_eq!(test.rating.unwrap().power_w, 20.0);
+        assert!(m.load_voltage_rms_v > 240.0);
+        assert!(m.load_resistor_power_w > 20.0);
+        assert!(m.source_power_w.is_finite());
+        assert!(m.quality_pass, "{m:?}");
+        assert_eq!(
+            h.app.read_live_circuit().unwrap().resistance,
+            before.resistance
+        );
+        assert_eq!(h.app.sweep.as_ref().map(|s| s.results.len()), saved);
+        assert_eq!(h.app.selected, selected);
+        h.app.form[2] = "1000".into();
+        h.app.run_power_test();
+        assert!(h.app.power_test.as_ref().unwrap().rating.is_none());
     }
 
     #[test]
